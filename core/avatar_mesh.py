@@ -340,12 +340,68 @@ def build_head() -> dict:
     }
 
 
-_CACHE: dict | None = None
+_FEMALE_OBJ = Path(__file__).resolve().parent / "female_face_model.obj"
 
 
-def get_head_mesh() -> dict:
-    """Process-wide cached mesh — every HudCanvas shares the same arrays."""
+def build_female_head() -> dict:
+    """Build the female anime head mesh with voice-reactive jaw rigging."""
+    if not _FEMALE_OBJ.exists():
+        return build_head()
+    verts, faces = _load_obj(_FEMALE_OBJ)
+    outward = verts - np.array([0.0, verts[:, 1].mean(), 0.0])
+    normals = _vertex_normals(verts, faces, outward)
+
+    # Jaw rig: chin is at bottom, mouth around y ≈ -0.15, z > 0
+    chin_y = verts[:, 1].min()
+    mouth_y = -0.15
+    jaw = np.clip((mouth_y - verts[:, 1]) / (mouth_y - chin_y), 0.0, 1.0) ** 0.8
+    jaw *= np.clip((verts[:, 2] + 0.1) / 0.45, 0.0, 1.0)
+    jaw *= np.clip(1.0 - (np.abs(verts[:, 0]) / 0.40) ** 2, 0.0, 1.0)
+
+    # Brow rig: brow line at y ≈ 0.25
+    brow_y = 0.25
+    brow = np.exp(-((verts[:, 1] - brow_y) / 0.12) ** 2)
+    brow *= np.clip(verts[:, 2] / 0.35, 0.0, 1.0)
+    brow *= np.exp(-(verts[:, 0] / 0.35) ** 2)
+
+    # Lips rig: mouth region around y ≈ -0.25, z ≈ 0.35
+    lip_c = np.array([0.0, -0.25, 0.35], dtype=np.float32)
+    lips = np.exp(-((verts[:, 1] - lip_c[1]) / 0.15) ** 2)
+    lips *= np.exp(-(verts[:, 0] / 0.25) ** 2)
+    lips *= np.clip(verts[:, 2] / 0.35, 0.0, 1.0)
+
+    fade = np.clip((verts[:, 1] - verts[:, 1].min()) / 0.25, 0.3, 1.0)
+    edges = _unique_edges(faces)[::_WIRE_STRIDE]
+    face_group = np.zeros(len(faces), dtype=np.int32)
+
+    return {
+        "face_group": np.ascontiguousarray(1 - face_group, dtype=np.float32),
+        "brow": np.ascontiguousarray(brow, dtype=np.float32),
+        "lips": np.ascontiguousarray(lips, dtype=np.float32),
+        "lip_centre": np.ascontiguousarray(lip_c, dtype=np.float32),
+        "verts": np.ascontiguousarray(verts, dtype=np.float32),
+        "normals": np.ascontiguousarray(normals, dtype=np.float32),
+        "faces": np.ascontiguousarray(faces, dtype=np.int32),
+        "edges": np.ascontiguousarray(edges, dtype=np.int32),
+        "jaw": np.ascontiguousarray(jaw, dtype=np.float32),
+        "fade": np.ascontiguousarray(fade, dtype=np.float32),
+        "landmarks": {},
+        "n_face": len(verts),
+        "n_head": len(verts),
+        "span": (float(verts[:, 1].max()), float(verts[:, 1].min())),
+    }
+
+
+_CACHE: dict[str, dict] = {}
+
+
+def get_head_mesh(variant: str = "default") -> dict:
+    """Process-wide cached mesh supporting 'default' (male) and 'female' variants."""
     global _CACHE
-    if _CACHE is None:
-        _CACHE = build_head()
-    return _CACHE
+    key = "female" if str(variant).lower() == "female" else "default"
+    if key not in _CACHE:
+        if key == "female":
+            _CACHE["female"] = build_female_head()
+        else:
+            _CACHE["default"] = build_head()
+    return _CACHE[key]

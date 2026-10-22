@@ -64,6 +64,15 @@ def _get_api_key() -> str:
 
 def _open_url(url: str) -> None:
     try:
+        from actions.browser_control import _navigate_current_tab, _open_native
+        if _navigate_current_tab(url, "chrome"):
+            return
+        res = _open_native(url, "chrome")
+        if "Opened" in res:
+            return
+    except Exception:
+        pass
+    try:
         if is_mac():
             subprocess.Popen(["open", url])
         elif is_linux():

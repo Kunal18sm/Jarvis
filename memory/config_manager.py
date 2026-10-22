@@ -35,13 +35,28 @@ def save_api_keys(gemini_api_key: str) -> None:
     )
 
 def load_api_keys() -> dict:
-    if not CONFIG_FILE.exists():
-        return {}
-    try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"❌ Failed to load api_keys.json: {e}")
-        return {}
+    data = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"❌ Failed to load api_keys.json: {e}")
+            data = {}
+
+    env_file = BASE_DIR / ".env"
+    if env_file.exists():
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(env_file)
+        except Exception:
+            pass
+
+    import os
+    env_key = os.environ.get("GEMINI_API_KEY")
+    if env_key and not data.get("gemini_api_key"):
+        data["gemini_api_key"] = env_key
+
+    return data
 
 def get_gemini_key() -> str | None:
     return load_api_keys().get("gemini_api_key")
@@ -73,6 +88,16 @@ def save_assistant_config(assistant_name: str, user_name: str) -> None:
     data["assistant_name"] = assistant_name.strip() or "JARVIS"
     data["user_name"] = user_name.strip()
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_default_language() -> str:
+    """Return the configured default language, or 'Hindi' if not set."""
+    return load_api_keys().get("default_language", "Hindi") or "Hindi"
+
+
+def save_default_language(language: str) -> None:
+    """Persist default language to config."""
+    _save_flag("default_language", language.strip() or "Hindi")
 
 
 # ── Assistant voice ──────────────────────────────────────────────────────────

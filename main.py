@@ -43,6 +43,8 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+import os
+os.chdir(Path(__file__).resolve().parent)
 
 import sounddevice as sd
 import numpy as np
@@ -67,7 +69,7 @@ from actions.proactive         import ProactiveEngine
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
-from actions.web_search        import _news as _fetch_news_sync
+
 from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
@@ -255,9 +257,7 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
     language.
     """
     out = [
-        "- Anything not listed above is outside your reach. Say so in one clause "
-        "and offer the nearest thing you can actually do — never mime an action "
-        "you cannot take, and never report a result you did not get.",
+        "- Tasks without a dedicated single-purpose API tool can be executed step-by-step using GUI automation (computer_control: screen_click, right_click, hover, hotkey, typing). Proactively attempt desktop operations rather than refusing.",
         "- You act on this machine only. You cannot reach the user's other "
         "devices, accounts or hardware except through the tools listed above.",
         "- You remember what is in the memory block and what has been said this "
@@ -1000,6 +1000,14 @@ class JarvisLive:
             f"{_addr}\n\n"
         )
 
+        _def_lang = (_cfg.get("default_language") or "Hindi").strip() or "Hindi"
+        language_ctx = (
+            f"[PRIMARY LANGUAGE]\n"
+            f"Your default and primary spoken language is {_def_lang} (natural conversational Hindi / Hinglish). "
+            f"Always respond, explain, and interact in polite Hindi / Hinglish. "
+            f"Only switch to English or another language if the user explicitly speaks to you in that language.\n\n"
+        )
+
         # Everything the model is told about *itself* is derived here, not
         # written into prompt.txt: the name comes from config, the platform from
         # the host, the capability list from the registries that were just
@@ -1020,7 +1028,25 @@ class JarvisLive:
             ),
         })
 
-        parts = [time_ctx, identity_ctx]
+        _cur_voice = get_voice().strip()
+        _is_female = _cur_voice.lower() in ("kore", "aoede")
+        if _is_female:
+            gender_ctx = (
+                f"[GENDER & IDENTITY: FEMALE PERSONA]\n"
+                f"You are a female AI assistant with a female voice ({_cur_voice}) and female avatar.\n"
+                "In Hindi and Hinglish, you MUST ALWAYS address yourself using FEMININE first-person verb forms:\n"
+                "  • ALWAYS say: 'kar sakti hu', 'karti hu', 'bata sakti hu', 'samajh sakti hu', 'dekh rahi hu', 'aa rahi hu'.\n"
+                "  • NEVER say masculine forms like: 'kar sakta hu', 'karta hu', 'bata sakta hu', 'dekh raha hu'.\n"
+                "  • Examples: 'Ji sir, mai aapki kya madad kar sakti hu?', 'Mai abhi check karke batati hu.', 'Mai ye file open kar sakti hu.'\n\n"
+            )
+        else:
+            gender_ctx = (
+                f"[GENDER & IDENTITY: STANDARD PERSONA]\n"
+                f"You have a voice ({_cur_voice}). In Hindi/Hinglish, you use standard masculine verb forms for yourself: "
+                "'kar sakta hu', 'karta hu', 'bata sakta hu'.\n\n"
+            )
+
+        parts = [time_ctx, identity_ctx, gender_ctx, language_ctx]
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
@@ -1410,21 +1436,31 @@ class JarvisLive:
                 # now — exclusive mode, a webcam already in use, a virtual mic
                 # whose source went away. Chosen hardware failing must never
                 # mean the assistant cannot hear at all.
-                if _mic_dev is None:
-                    raise
-                print(f"[JARVIS] ⚠️  Mic '{_mic_name}' failed: {_e} — using default")
-                self.ui.write_log(
-                    f"SYS: Microphone '{_mic_name}' unavailable — using system default."
-                )
-                _mic_stream = _open_mic(None)
+                if _mic_dev is not None:
+                    print(f"[JARVIS] ⚠️  Mic '{_mic_name}' failed: {_e} — using default")
+                    self.ui.write_log(
+                        f"SYS: Microphone '{_mic_name}' unavailable — using system default."
+                    )
+                try:
+                    _mic_stream = _open_mic(None)
+                except Exception as _e2:
+                    print(f"[JARVIS] ⚠️ No microphone available ({_e2}) — keyboard/text mode active")
+                    self.ui.write_log("SYS: No microphone detected — typing/keyboard mode is active.")
+                    while True:
+                        await asyncio.sleep(1)
+                    return
 
             with _mic_stream:
                 print("[JARVIS] 🎤 Mic stream open")
                 while True:
                     await asyncio.sleep(0.1)
-        except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
+        except asyncio.CancelledError:
             raise
+        except Exception as e:
+            print(f"[JARVIS] ❌ Mic: {e} — falling back to keyboard mode")
+            self.ui.write_log("SYS: Microphone error — keyboard mode is active.")
+            while True:
+                await asyncio.sleep(1)
 
     async def _flush_pending_vision(self) -> bool:
         """Send a captured frame immediately after its tool response.
@@ -1620,14 +1656,17 @@ class JarvisLive:
         try:
             stream = _open_spk(_spk_dev)
         except Exception as _e:
-            # A chosen output that the host API accepts by name but refuses to
-            # open (exclusive mode, wrong sample rate, device asleep) must not
-            # cost the user their voice. Fall back to the default and say so.
-            if _spk_dev is None:
-                raise
-            print(f"[JARVIS] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
-            self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
-            stream = _open_spk(None)
+            if _spk_dev is not None:
+                print(f"[JARVIS] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
+                self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
+            try:
+                stream = _open_spk(None)
+            except Exception as _e2:
+                print(f"[JARVIS] ⚠️ Output device failed: {_e2}")
+                self.ui.write_log("SYS: No output speaker detected.")
+                while True:
+                    await asyncio.sleep(1)
+                return
 
         # Ask the device how far behind the speakers actually are, rather than
         # assuming. This is what the echo tail is sized from, so a machine with a
@@ -1725,24 +1764,28 @@ class JarvisLive:
                     await asyncio.to_thread(stream.write, bytes(batch))
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
-            raise
+            while True:
+                await asyncio.sleep(1)
         finally:
             self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            if "stream" in locals() and stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
     async def _send_startup_briefing(self) -> None:
         """
-        Two-phase briefing optimized for speed:
-          Phase 1 — instant greeting (no tools) → speech starts in <1s
-          Phase 2 — news pre-fetched in a background thread while Phase 1 plays,
-                    delivered as ready text (no Gemini tool-call round-trip) and
-                    shown on the UI content panel. Waits for turn_complete event
-                    instead of a fixed sleep so there is no unnecessary gap.
+        Instant polite startup greeting (no unprompted news):
+        Greets the user in Hindi based on the time of day (Good Morning / Afternoon / Evening),
+        announces JARVIS is online and ready, and quietly waits for user input.
         """
         memory   = load_memory()
         identity = memory.get("identity", {})
@@ -1751,26 +1794,24 @@ class JarvisLive:
             e = identity.get(k, {})
             return (e.get("value", "") if isinstance(e, dict) else str(e)).strip()
 
-        lang = _val("language")
-        name = _val("name")
-        time_str = datetime.now().strftime("%H:%M")
+        lang = _val("language") or "Hindi"
+        name = _val("name") or "Sir"
+        now  = datetime.now()
+        hour = now.hour
+        time_str = now.strftime("%I:%M %p")
 
-        # Start fetching news immediately — runs in parallel while phase 1 plays
-        loop = asyncio.get_event_loop()
-        news_future = loop.run_in_executor(None, _fetch_news_sync, "top world news today")
+        if 5 <= hour < 12:
+            time_greeting = "Good Morning"
+        elif 12 <= hour < 17:
+            time_greeting = "Good Afternoon"
+        elif 17 <= hour < 22:
+            time_greeting = "Good Evening"
+        else:
+            time_greeting = "Hello"
 
         await asyncio.sleep(0.3)
         if not self.session:
             return
-
-        # ── Phase 1: instant greeting ─────────────────────────────────────────
-        # The briefing fires before the user has said anything, so the
-        # remembered language is the only signal there is. It is a starting
-        # point, not a setting: the moment they reply, their language wins.
-        lang_clause = (f" Speak this greeting in {lang}, then follow the "
-                       f"user's own language from their first reply onward."
-                       if lang else "")
-        name_clause = f" Address the user as {name}." if name else ""
 
         # Inject last session context if available — pop removes it so it's never repeated
         last = await asyncio.to_thread(pop_last_session)
@@ -1781,93 +1822,25 @@ class JarvisLive:
                 _when  = "earlier today" if _delta == 0 else ("yesterday" if _delta == 1 else f"{_delta} days ago")
             except Exception:
                 _when = "last time"
-            session_clause = (
-                f" Also briefly and naturally mention that {_when}: {last['summary']}"
-            )
+            session_clause = f" If relevant, very briefly mention that {_when}: {last['summary']}"
 
-        p1 = (
-            f"Greet the user warmly, mention it is {time_str}, and say you are fetching today's news now.{session_clause} "
-            f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
+        p = (
+            f"Speak in natural conversational Hindi (Hinglish). "
+            f"Greet the user respectfully with '{time_greeting} {name}', say that you are online and ready to assist, "
+            f"and ask how you can help them today.{session_clause} "
+            f"Keep it strictly to 1 short, warm sentence. "
+            f"Do NOT mention or read any news headlines. Do NOT fetch news. Do NOT call any tools. "
+            f"Simply greet and wait quietly for the user's voice command."
         )
 
-        # Clear the turn-done event so we can wait for Phase 1 to finish
         if self._turn_done_event:
             self._turn_done_event.clear()
 
         await self.session.send_client_content(
-            turns={"role": "user", "parts": [{"text": p1}]},
+            turns={"role": "user", "parts": [{"text": p}]},
             turn_complete=True,
         )
-        print("[JARVIS] Briefing phase 1 (greeting) sent.")
-
-        # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
-        async def _deliver_news():
-            try:
-                lang_str = (f" Speak in {lang} unless the user has since "
-                            f"spoken another language, in which case use theirs."
-                            if lang else "")
-
-                # Wait for news fetch (already running) and Phase 1 turn-complete
-                # in parallel — whichever takes longer determines the wait time
-                news_done   = asyncio.wrap_future(news_future)
-                turn_waited = False
-                if self._turn_done_event:
-                    try:
-                        await asyncio.wait_for(self._turn_done_event.wait(), timeout=6.0)
-                        turn_waited = True
-                    except asyncio.TimeoutError:
-                        pass
-
-                # Extra buffer: turn_complete fires when Gemini finishes *generating*
-                # Phase 1, but audio may still be playing.  Waiting a beat here
-                # prevents Phase 2 audio from arriving while Phase 1 is mid-sentence
-                # (which sounds like a "repeated first response" to the user).
-                if turn_waited:
-                    await asyncio.sleep(0.8)
-                else:
-                    await asyncio.sleep(1.0)
-
-                try:
-                    news_text = await asyncio.wait_for(news_done, timeout=8.0)
-                except Exception as e:
-                    self.ui.write_log(f"SYS: News fetch timed out/failed: {e!r}")
-                    news_text = ""
-
-                if not self.session:
-                    return
-
-                failed = (not news_text) or news_text.startswith(
-                    ("No news found", "Search failed", "Please provide")
-                )
-                if not failed:
-                    # Show on UI content panel immediately
-                    self.ui.show_content("NEWS — top world news today", news_text)
-
-                    p2 = (
-                        f"[BRIEFING] Here are today's top news headlines:\n{news_text}\n\n"
-                        "Pick ONE headline, summarise it in one sentence, then say the full list "
-                        f"is displayed on screen. Do not call any tools.{lang_str}"
-                    )
-                else:
-                    self.ui.write_log(
-                        f"SYS: News unavailable — backend returned: {news_text[:120]!r}"
-                    )
-                    p2 = (
-                        "News headlines could not be fetched right now. "
-                        f"Let the user know briefly.{lang_str}"
-                    )
-
-                await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": p2}]},
-                    turn_complete=True,
-                )
-                print("[JARVIS] Briefing phase 2 (news) sent.")
-            except Exception as e:
-                print(f"[Briefing] Phase 2 error: {e}")
-                print(f"[JARVIS] Briefing phase 2 failed: {e}")
-                self.ui.write_log("SYS: Could not fetch the news for the briefing.")
-
-        asyncio.create_task(_deliver_news())
+        print(f"[JARVIS] Startup greeting ({time_greeting}) sent.")
 
     # ── Session memory ──────────────────────────────────────────────────────────
 

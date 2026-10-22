@@ -124,8 +124,32 @@ class HoloAvatar:
     # see-through glass wireframe. Flip here, or per instance.
     shaded = True
 
-    def __init__(self) -> None:
-        mesh = get_head_mesh()
+    def __init__(self, variant: str = "default") -> None:
+        self.variant = variant
+        self.load_mesh(variant)
+
+        self._t = 0.0
+        self._sway = 0.0           # integrated sway phase — see step()
+        self._yaw = 0.0
+        self._pitch = 0.0
+        self._mouth = 0.0          # 0..1 smoothed jaw opening
+        self._glow = 0.0           # 0..1 smoothed overall energy
+        self._scan = -1.6          # vertical position of the energy sweep
+        self._blink = 0.0          # 0 = open, 1 = shut
+        self._blink_at = 3.0
+
+        self._amp_slow = 0.0
+        self._expr = 0.0
+        self._expr_tgt = 0.0
+        self._expr_at = 0.0
+        self._brow = 0.0           # smoothed brow lift, -0.4 .. 1.2
+        self._emph = 0.0           # syllable emphasis, drives the head nod
+        self._gaze = [0.0, 0.0]
+        self._gaze_tgt = [0.0, 0.0]
+
+    def load_mesh(self, variant: str = "default") -> None:
+        mesh = get_head_mesh(variant)
+        self.variant = variant
         self._v0 = mesh["verts"]
         self._n0 = mesh["normals"]
         self._jaw = mesh["jaw"]
@@ -139,25 +163,17 @@ class HoloAvatar:
         self._e0 = mesh["edges"][:, 0]
         self._e1 = mesh["edges"][:, 1]
         self._lm = mesh["landmarks"]
-        # The inner-lip ring runs lower-lip left→right, then upper-lip back.
-        # Splitting it lets the upper arc anchor a strip of teeth, which is what
-        # keeps an open mouth from reading as a hole punched in the face.
-        lips_in = mesh["landmarks"]["lips_in"]
-        self._lip_up = np.concatenate([lips_in[10:], lips_in[:1]])
+        if "lips_in" in self._lm and len(self._lm["lips_in"]) > 10:
+            lips_in = self._lm["lips_in"]
+            self._lip_up = np.concatenate([lips_in[10:], lips_in[:1]])
+        else:
+            self._lip_up = np.array([], dtype=np.int32)
 
-        # Crown (+1.0) down to the bottom of the neck, in head-half-heights.
-        # Callers size the head to the room they have with this.
         self.SPAN = mesh["span"][0] - mesh["span"][1]
-
-        self._lut_cache: list = []
+        self._lut_cache = []
         self._lut_key = None
-
         n = self._v0.shape[0]
         self._v = np.empty((n, 3), dtype=np.float32)
-
-        self._t = 0.0
-        self._sway = 0.0           # integrated sway phase — see step()
-        self._yaw = 0.0
         self._pitch = 0.0
         self._mouth = 0.0          # 0..1 smoothed jaw opening
         self._glow = 0.0           # 0..1 smoothed overall energy
@@ -645,6 +661,8 @@ class HoloAvatar:
             return
 
         lm = self._lm
+        if not lm or "eye_l" not in lm or len(lm["eye_l"]) == 0:
+            return
         vis = 1.0 - self._blink
 
         # ── eyes ────────────────────────────────────────────────────────────

@@ -34,7 +34,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
     QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
-    QPen, QPixmap, QRadialGradient, QShortcut,
+    QPen, QPixmap, QRadialGradient, QShortcut, QTransform,
 )
 # Video playback for the HUD. Part of PyQt6, so it costs no new dependency —
 # but the multimedia plugins are a separate piece of the Qt install and can be
@@ -414,14 +414,28 @@ class HudCanvas(QWidget):
         self.state    = "INITIALISING"
         self._assistant_name = assistant_name
 
-        # The holographic head that fills the HUD. If it could not be imported
-        # we fall back to the old glowing core so the panel is never empty.
+        # The holographic head that fills the HUD.
         self._avatar = None
         if HoloAvatar is not None:
             try:
-                self._avatar = HoloAvatar()
+                from memory.config_manager import get_voice
+                _cur_v = get_voice().lower()
+                _var = "female" if _cur_v in ("kore", "aoede") else "default"
+                self._avatar = HoloAvatar(variant=_var)
             except Exception:
-                self._avatar = None
+                try:
+                    self._avatar = HoloAvatar()
+                except Exception:
+                    self._avatar = None
+
+        # Textured female avatar 3D yaw perspective sprites
+        self._female_yaw_idle = []
+        self._female_yaw_speak = []
+        self._female_yaw_blink = []
+        self._female_pix_idle = None
+        self._female_pix_speak = None
+        self._female_pix_blink = None
+        self._load_female_pixmaps()
 
         # Which centrepiece to draw. Read once here and changed live by the
         # settings toggle; the avatar object is kept either way so switching
@@ -442,9 +456,6 @@ class HudCanvas(QWidget):
         self._step_t     = time.time()
         self._blink      = True
         self._blink_tick = 0
-
-        # Rescaled-face cache: the smooth rescale is expensive, so we keep the
-        # last result and only rebuild it when the (quantised) size changes.
 
         # Static grid-dot layer, pre-rendered once per size/theme into a pixmap
         # so paintEvent blits it in one call instead of thousands of drawPoint()s.
@@ -467,6 +478,53 @@ class HudCanvas(QWidget):
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._tmr.start(16)
+
+    def _load_female_pixmaps(self):
+        """Load 3D horizontal yaw perspective sprites for the female anime avatar."""
+        try:
+            from pathlib import Path
+            _f_dir = Path(__file__).resolve().parent / "core"
+            self._female_yaw_idle = []
+            self._female_yaw_speak = []
+            self._female_yaw_blink = []
+            for i in range(11):
+                p_idle = _f_dir / f"female_yaw_{i}_idle.png"
+                p_spk  = _f_dir / f"female_yaw_{i}_speak.png"
+                p_blk  = _f_dir / f"female_yaw_{i}_blink.png"
+                if p_idle.exists():
+                    self._female_yaw_idle.append(QPixmap(str(p_idle)))
+                if p_spk.exists():
+                    self._female_yaw_speak.append(QPixmap(str(p_spk)))
+                if p_blk.exists():
+                    self._female_yaw_blink.append(QPixmap(str(p_blk)))
+            p_base_idle = _f_dir / "female_avatar_idle.png"
+            p_base_spk  = _f_dir / "female_avatar_speak.png"
+            p_base_blk  = _f_dir / "female_avatar_blink.png"
+            if p_base_idle.exists():
+                self._female_pix_idle = QPixmap(str(p_base_idle))
+            if p_base_spk.exists():
+                self._female_pix_speak = QPixmap(str(p_base_spk))
+            if p_base_blk.exists():
+                self._female_pix_blink = QPixmap(str(p_base_blk))
+        except Exception:
+            pass
+
+    def update_avatar_variant(self):
+        """Switch between female 3D model (for Kore/Aoede) and default 3D model."""
+        try:
+            from memory.config_manager import get_voice
+            v = get_voice().lower()
+            target_var = "female" if v in ("kore", "aoede") else "default"
+            if self._avatar is None:
+                if HoloAvatar is not None:
+                    self._avatar = HoloAvatar(variant=target_var)
+            elif getattr(self._avatar, "variant", None) != target_var:
+                self._avatar.load_mesh(target_var)
+            if target_var == "female":
+                self._load_female_pixmaps()
+            self.update()
+        except Exception:
+            pass
 
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
         """Ask the avatar to look somewhere for a moment (see HoloAvatar.glance)."""
@@ -560,6 +618,8 @@ class HudCanvas(QWidget):
 
     def _step(self):
         self._tick += 1
+        if self._tick % 60 == 0:
+            self.update_avatar_variant()
         now = time.time()
 
         # ── Live audio reactivity ────────────────────────────────────────────
@@ -693,6 +753,78 @@ class HudCanvas(QWidget):
         if self.state == "LISTENING":
             return qcol(C.PRI), qcol(C.GREEN)
         return qcol(C.PRI), qcol(C.PRI_DIM)
+
+    def _paint_female_avatar(self, p: QPainter, cx: float, cy: float, r: float,
+                             primary: QColor, accent: QColor) -> None:
+        """Render high-fidelity holographic anime avatar with continuous 60-FPS 3D horizontal rotation,
+        natural blinking, and real-time speech lip sync."""
+        amp = self._amp_disp
+        st = (self.state or "").upper()
+
+        # Continuous floating-point yaw angle from avatar physics (approx -0.25 to +0.25 radians)
+        yaw = getattr(self._avatar, "_yaw", 0.0) if self._avatar is not None else 0.0
+
+        # ── Holographic Sci-Fi Aura Glow Behind Head ──────────────────────
+        ar = r * 1.30
+        glow = QRadialGradient(cx, cy, ar)
+        col_core = QColor(accent)
+        col_core.setAlpha(40 if self.speaking else 18)
+        glow.setColorAt(0.00, col_core)
+        col_mid = QColor(accent)
+        col_mid.setAlpha(16 if self.speaking else 7)
+        glow.setColorAt(0.60, col_mid)
+        col_fade = QColor(accent)
+        col_fade.setAlpha(0)
+        glow.setColorAt(1.00, col_fade)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(glow))
+        p.drawEllipse(QRectF(cx - ar, cy - ar, ar * 2, ar * 2))
+
+        # ── State & Feature Selection: Idle, Blink, or Speech ─────────────
+        blink_val = getattr(self._avatar, "_blink", 0.0) if self._avatar is not None else 0.0
+        is_asleep = st in ("SLEEPING", "STANDBY", "OFFLINE")
+        is_talking = not self.muted and self.speaking
+        m_val = getattr(self._avatar, "_mouth", 0.0) if self._avatar is not None else 0.0
+        if m_val < 0.04 and amp > 0.04:
+            m_val = amp * 0.9
+
+        # Dynamic feature selection:
+        # 1. Blinking or sleeping -> blink sprite (closed eyelids)
+        # 2. Speaking with audible mouth volume -> speak sprite (parted lips with teeth)
+        # 3. Otherwise -> idle sprite
+        if (blink_val > 0.22 or is_asleep):
+            pix = self._female_pix_blink or self._female_pix_idle
+        elif is_talking and m_val >= 0.14:
+            pix = self._female_pix_speak or self._female_pix_idle
+        else:
+            pix = self._female_pix_idle
+
+        if pix is None:
+            return
+
+        # ── 60-FPS Buttery-Smooth Continuous 3D Horizontal Rotation ──────
+        target_h = int(r * 2.38)
+        scaled = pix.scaledToHeight(target_h, Qt.TransformationMode.SmoothTransformation)
+        pw, ph = scaled.width(), scaled.height()
+
+        # Convert continuous yaw (radians) to rotation degrees around vertical Y-axis
+        # This turns the head left and right horizontally across the X-axis continuously
+        deg = yaw * (180.0 / math.pi) * 0.70
+
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        tr = QTransform()
+        tr.translate(cx, cy)
+        tr.rotate(deg, Qt.Axis.YAxis)
+        tr.translate(-pw / 2.0, -ph * 0.52)
+
+        p.setTransform(tr, True)
+        p.drawPixmap(0, 0, scaled)
+        p.restore()
+
+
 
     def _paint_core(self, p: QPainter, cx: float, cy: float, r: float,
                     W: float = 0.0, H: float = 0.0):
@@ -881,7 +1013,10 @@ class HudCanvas(QWidget):
                     _acc = qcol(C.GREEN)
                 else:
                     _acc = qcol(C.PRI)
-            self._avatar.paint(p, cx, _head_cy, _r_head, _main, _acc, qcol(C.BG))
+            if getattr(self._avatar, "variant", None) == "female" and self._female_pix_idle is not None:
+                self._paint_female_avatar(p, cx, _head_cy, _r_head, _main, _acc)
+            else:
+                self._avatar.paint(p, cx, _head_cy, _r_head, _main, _acc, qcol(C.BG))
 
         # reactor core — the other centrepiece, and the fallback if the head
         # could not be built. There is no third path: the old face.png branch
@@ -939,6 +1074,31 @@ class HudCanvas(QWidget):
             p.fillRect(QRectF(wx0 + i * bw, wy + 20 - hgt, bw - 1, hgt), cl)
 
         p.end()   # end deterministically so the backing store never flushes an active painter
+
+    def mousePressEvent(self, e):
+        win = self.window()
+        if getattr(win, "_is_face_mode", False) and e.button() == Qt.MouseButton.LeftButton:
+            win._drag_pos = e.globalPosition().toPoint() - win.frameGeometry().topLeft()
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        win = self.window()
+        if getattr(win, "_is_face_mode", False) and e.buttons() == Qt.MouseButton.LeftButton and hasattr(win, "_drag_pos"):
+            win.move(e.globalPosition().toPoint() - win._drag_pos)
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        win = self.window()
+        if getattr(win, "_is_face_mode", False):
+            win.toggle_display_mode("standard")
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
 
 class MetricBar(QWidget):
 
@@ -2181,7 +2341,7 @@ class MemoryOverlay(_HudOverlay):
     the other half of that change — a memory you cannot inspect is a memory you
     cannot trust, and 'delete' has to be something the person can do."""
 
-    _OW = 520
+    _OW = 580
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2194,30 +2354,19 @@ class MemoryOverlay(_HudOverlay):
             }}
         """)
         self.setFixedWidth(self._OW)
+        self._last_msg = ""
 
         self._lay = QVBoxLayout(self)
         self._lay.setContentsMargins(20, 16, 20, 16)
-        self._lay.setSpacing(5)
+        self._lay.setSpacing(6)
         self._rebuild()
 
     def _clear_layout(self):
-        """Take every item out of the layout and detach it from the widget tree
-        in this call.
-
-        deleteLater() on its own is not enough: it queues destruction for the
-        next event-loop pass, and until then the old rows are still children of
-        this widget and still paint — which is what drew half of the previous
-        panel over the new one. setParent(None) removes them from the tree now;
-        deleteLater() then frees them safely."""
+        """Take every item out of the layout and detach it from the widget tree."""
         while self._lay.count():
             item = self._lay.takeAt(0)
             w = item.widget()
             if w is not None:
-                # hide() stops it painting in this frame; deleteLater() frees it
-                # safely afterwards. setParent(None) would also stop the paint,
-                # but it turns the widget into a top-level window for the moment
-                # between the two calls, which is not something to leave lying
-                # around inside a click handler.
                 w.hide()
                 w.deleteLater()
                 continue
@@ -2232,22 +2381,6 @@ class MemoryOverlay(_HudOverlay):
                 sub.deleteLater()
 
     def _settle(self, before):
-        """Size the panel to its content, re-centre it, and repaint what the old
-        size covered.
-
-        The re-size has to happen here rather than at the end of _rebuild
-        because Qt has not polished the freshly-created children at that point,
-        so the size hint it would read is the empty-layout one. Measured: a
-        first adjustSize() returned 32 px for a panel whose content needed 155,
-        and a second call — after the same widgets had been through the event
-        loop — returned 155. So this runs twice: once now, once on the next
-        turn, from _rebuild.
-
-        The re-centre and the repaint are needed because the overlay is placed
-        by hand and is in no layout: shrinking it leaves it off-centre and
-        leaves its former pixels on screen, since nothing tells the parent that
-        region changed. The repaint has to cover the union of the old and new
-        rectangles."""
         self._lay.invalidate()
         self._lay.activate()
         self.updateGeometry()
@@ -2267,41 +2400,136 @@ class MemoryOverlay(_HudOverlay):
         self._clear_layout()
 
         from memory.memory_manager import all_entries_for_ui
+        from memory.storage_manager import (
+            get_storage_stats,
+            clear_browser_cache,
+            clear_temp_files,
+            clear_memory,
+            clear_all_storage,
+            format_bytes,
+        )
 
-        hdr = QLabel("🧠  WHAT JARVIS REMEMBERS")
+        hdr_row = QHBoxLayout()
+        hdr = QLabel("🧠  MEMORY & STORAGE MANAGER")
         hdr.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
         hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        self._lay.addWidget(hdr)
+        hdr_row.addWidget(hdr)
+        hdr_row.addStretch()
+
+        ref_btn = QPushButton("🔄 REFRESH")
+        ref_btn.setFixedSize(84, 22)
+        ref_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        ref_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ref_btn.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED}; border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI}; }}
+        """)
+        ref_btn.clicked.connect(lambda: QTimer.singleShot(0, self._rebuild))
+        hdr_row.addWidget(ref_btn)
+        self._lay.addLayout(hdr_row)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 1px 0;")
         self._lay.addWidget(sep)
 
-        rows = all_entries_for_ui()
+        # ── Storage Consumption Box ──────────────────────────────────────────
+        stats = get_storage_stats()
+        card = QFrame()
+        card.setStyleSheet(f"""
+            QFrame {{
+                background: {C.PANEL2};
+                border: 1px solid {C.BORDER_B};
+                border-radius: 4px;
+            }}
+        """)
+        c_lay = QVBoxLayout(card)
+        c_lay.setContentsMargins(10, 8, 10, 8)
+        c_lay.setSpacing(6)
 
-        cap = QLabel(f"{len(rows)} stored facts — newest first. "
-                     f"Nothing here is sent anywhere; it lives in "
-                     f"memory/long_term.json on this machine.")
-        cap.setWordWrap(True)
-        cap.setFont(QFont("Courier New", 7))
-        cap.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        tot_lbl = QLabel(f"TOTAL STORAGE CONSUMED: <b style='color:{C.PRI}; font-size:13px;'>{stats['total_formatted']}</b>")
+        tot_lbl.setFont(QFont("Courier New", 9))
+        tot_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
+        c_lay.addWidget(tot_lbl)
+
+        grid_lbl = QLabel(
+            f"• Long-Term Memory: <b style='color:{C.TEXT}'>{stats['memory_formatted']}</b> ({stats['facts_count']} facts)\n"
+            f"• Browser Profiles & Cache: <b style='color:{C.ACC2}'>{stats['browser_cache_formatted']}</b>\n"
+            f"• Temporary & Screenshots: <b style='color:{C.TEXT_MED}'>{stats['temp_formatted']}</b>"
+        )
+        grid_lbl.setFont(QFont("Courier New", 8))
+        grid_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        c_lay.addWidget(grid_lbl)
+
+        if self._last_msg:
+            msg_lbl = QLabel(self._last_msg)
+            msg_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            msg_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; padding: 2px 0;")
+            c_lay.addWidget(msg_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+
+        c_cache_btn = QPushButton("🗑️ CLEAR CACHE & TEMP")
+        c_cache_btn.setFixedHeight(26)
+        c_cache_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        c_cache_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        c_cache_btn.setToolTip("Deletes browser automation cache and temp files to free disk space")
+        c_cache_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL}; color: {C.ACC2}; border: 1px solid {C.BORDER_B}; border-radius: 3px; padding: 0 6px; }}
+            QPushButton:hover {{ background: rgba(255, 204, 0, 30); border-color: {C.ACC2}; }}
+        """)
+        c_cache_btn.clicked.connect(self._clear_cache)
+        btn_row.addWidget(c_cache_btn)
+
+        c_mem_btn = QPushButton("🧹 CLEAR ALL MEMORY")
+        c_mem_btn.setFixedHeight(26)
+        c_mem_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        c_mem_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        c_mem_btn.setToolTip("Wipes stored facts from long_term.json")
+        c_mem_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL}; color: {C.RED}; border: 1px solid {C.BORDER_B}; border-radius: 3px; padding: 0 6px; }}
+            QPushButton:hover {{ background: rgba(255, 51, 85, 30); border-color: {C.RED}; }}
+        """)
+        c_mem_btn.clicked.connect(self._clear_memory)
+        btn_row.addWidget(c_mem_btn)
+
+        wipe_btn = QPushButton("✨ WIPE EVERYTHING")
+        wipe_btn.setFixedHeight(26)
+        wipe_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        wipe_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        wipe_btn.setToolTip("Clears all cache, temp files, and memory")
+        wipe_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL}; color: {C.MUTED_C}; border: 1px solid {C.BORDER_B}; border-radius: 3px; padding: 0 6px; }}
+            QPushButton:hover {{ background: rgba(255, 51, 102, 35); border-color: {C.MUTED_C}; }}
+        """)
+        wipe_btn.clicked.connect(self._wipe_all)
+        btn_row.addWidget(wipe_btn)
+
+        c_lay.addLayout(btn_row)
+        self._lay.addWidget(card)
+
+        # ── Facts List ───────────────────────────────────────────────────────
+        rows = all_entries_for_ui()
+        cap = QLabel(f"<b>Stored Facts ({len(rows)}):</b>")
+        cap.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        cap.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; margin-top: 4px;")
         self._lay.addWidget(cap)
 
         if not rows:
-            empty = QLabel("Nothing stored yet.")
-            empty.setFont(QFont("Courier New", 9))
-            empty.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            empty = QLabel("No stored facts in memory.")
+            empty.setFont(QFont("Courier New", 8))
+            empty.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
             self._lay.addWidget(empty)
         else:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
-            scroll.setFixedHeight(min(420, 34 * len(rows) + 10))
+            scroll.setFixedHeight(min(320, 34 * len(rows) + 10))
             scroll.setStyleSheet(
                 f"QScrollArea {{ border: 1px solid {C.BORDER}; border-radius: 3px; "
                 f"background: transparent; }}"
             )
             inner = QWidget()
-            ilay  = QVBoxLayout(inner)
+            ilay = QVBoxLayout(inner)
             ilay.setContentsMargins(6, 6, 6, 6)
             ilay.setSpacing(3)
 
@@ -2323,7 +2551,7 @@ class MemoryOverlay(_HudOverlay):
                 rm.setFixedSize(20, 20)
                 rm.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
                 rm.setCursor(Qt.CursorShape.PointingHandCursor)
-                rm.setToolTip("Forget this")
+                rm.setToolTip("Forget this fact")
                 rm.setStyleSheet(f"""
                     QPushButton {{ background: transparent; color: {C.TEXT_DIM};
                         border: 1px solid {C.BORDER}; border-radius: 3px; }}
@@ -2342,7 +2570,7 @@ class MemoryOverlay(_HudOverlay):
             self._lay.addWidget(scroll)
 
         close = QPushButton("CLOSE")
-        close.setFixedHeight(30)
+        close.setFixedHeight(28)
         close.setFont(QFont("Courier New", 9))
         close.setCursor(Qt.CursorShape.PointingHandCursor)
         close.setStyleSheet(f"""
@@ -2354,18 +2582,30 @@ class MemoryOverlay(_HudOverlay):
         self._lay.addWidget(close)
 
         self._settle(before)
-        # …and again once Qt has polished the new children, because the size
-        # hint is not final until then. Harmless when the first pass already
-        # got it right: _settle is idempotent.
         QTimer.singleShot(0, lambda g=before: self._settle(g))
+
+    def _clear_cache(self):
+        from memory.storage_manager import clear_browser_cache, clear_temp_files, format_bytes
+        freed = clear_browser_cache() + clear_temp_files()
+        self._last_msg = f"✓ Cleared cache & temp ({format_bytes(freed)} freed)"
+        QTimer.singleShot(0, self._rebuild)
+
+    def _clear_memory(self):
+        from memory.storage_manager import clear_memory, format_bytes
+        freed = clear_memory(keep_identity=False)
+        self._last_msg = f"✓ Memory cleared ({format_bytes(freed)} freed)"
+        QTimer.singleShot(0, self._rebuild)
+
+    def _wipe_all(self):
+        from memory.storage_manager import clear_all_storage
+        res = clear_all_storage()
+        self._last_msg = f"✓ All storage and memory wiped ({res['freed_formatted']} freed)"
+        QTimer.singleShot(0, self._rebuild)
 
     def _forget(self, category: str, key: str):
         from memory.memory_manager import forget
         forget(key, category)
-        # Rebuild on the NEXT event-loop turn, not inside this click handler.
-        # The rebuild destroys the very ✕ button that emitted this signal, and
-        # Qt is entitled to touch the sender after a slot returns; tearing it
-        # down mid-emission is how a widget ends up half-alive on screen.
+        self._last_msg = f"✓ Forgotten: {category}/{key}"
         QTimer.singleShot(0, self._rebuild)
 
 
@@ -2958,10 +3198,21 @@ class MainWindow(QMainWindow):
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
+    _mode_sig       = pyqtSignal(str)   # display mode switch: 'face' | 'standard'
 
     def __init__(self, face_path: str):
         super().__init__()
         self._face_path = face_path
+
+        # ── Display Mode 2-Mode Architecture ─────────────────────────────
+        self._is_face_mode = False
+        self._saved_geometry = None
+        self._drag_pos = QPoint()
+        self._mode_sig.connect(self._apply_display_mode)
+        self._mode_shortcut = QShortcut(QKeySequence("F10"), self)
+        self._mode_shortcut.activated.connect(self.toggle_display_mode)
+        self._mode_shortcut_alt = QShortcut(QKeySequence("Ctrl+M"), self)
+        self._mode_shortcut_alt.activated.connect(self.toggle_display_mode)
 
         # Load customization from config
         _cfg = _read_full_config()
@@ -3008,7 +3259,8 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self._build_header())
+        self._header = self._build_header()
+        root.addWidget(self._header)
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -3202,7 +3454,8 @@ class MainWindow(QMainWindow):
         body.addWidget(self._right_panel, stretch=0)
 
         root.addLayout(body, stretch=1)
-        root.addWidget(self._build_footer())
+        self._footer = self._build_footer()
+        root.addWidget(self._footer)
 
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
@@ -3354,6 +3607,8 @@ class MainWindow(QMainWindow):
 
         self._video_title.setText(f"▶  {(title or 'VIDEO')[:44].upper()}")
         self._video_split = bool(audio_source)
+        self._current_video_source = source
+        self._current_video_title = title
         self._set_video_muted(bool(muted))
 
         url = (QUrl.fromLocalFile(source) if Path(source).exists()
@@ -3405,11 +3660,19 @@ class MainWindow(QMainWindow):
         """Silence whichever output is carrying the sound for this video."""
         muted = bool(muted)
         if self._video_audio:
-            # When the sound is a separate stream this player has none, but
-            # muting it too costs nothing and keeps the two paths identical.
             self._video_audio.setMuted(muted)
+            if not muted:
+                try:
+                    self._video_audio.setVolume(1.0)
+                except Exception:
+                    pass
         if self._video_sound_out:
             self._video_sound_out.setMuted(muted)
+            if not muted:
+                try:
+                    self._video_sound_out.setVolume(1.0)
+                except Exception:
+                    pass
         self._sync_video_mute_btn()
         self._sync_mic_for_video()
 
@@ -3477,7 +3740,18 @@ class MainWindow(QMainWindow):
             err = self._video_player.errorString()
         except Exception:
             pass
-        self.write_log(f"SYS: The video could not be played{(' — ' + err) if err else ''}.")
+        self.write_log(f"SYS: Video playback issue{(' — ' + err) if err else ''} — falling back to browser.")
+        target = getattr(self, "_current_video_title", "") or getattr(self, "_current_video_source", "")
+        if target:
+            try:
+                import webbrowser
+                from urllib.parse import quote_plus
+                if str(target).startswith("http"):
+                    webbrowser.open(str(target))
+                else:
+                    webbrowser.open(f"https://www.youtube.com/results?search_query={quote_plus(str(target))}")
+            except Exception:
+                pass
         self._on_video_close()
 
     def stop_video(self) -> None:
@@ -3831,6 +4105,123 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log.append_log(f"ERR: Shortcut failed — {e}")
 
+    def toggle_display_mode(self, target: str | None = None) -> str:
+        new_mode = target if target in ("face", "standard") else ("standard" if getattr(self, "_is_face_mode", False) else "face")
+        self._mode_sig.emit(new_mode)
+        return f"Display mode set to {new_mode}."
+
+    def _apply_display_mode(self, mode: str):
+        if mode == "face" and not getattr(self, "_is_face_mode", False):
+            self._is_face_mode = True
+            self._saved_geometry = self.geometry()
+
+            # Close open overlays
+            try:
+                self._close_setup()
+                self._close_controls()
+            except Exception:
+                pass
+
+            # Hide full HUD chrome
+            self._header.setVisible(False)
+            self._left_panel.setVisible(False)
+            self._right_panel.setVisible(False)
+            self._footer.setVisible(False)
+            self._content_panel.setVisible(False)
+            self._quiz_panel.setVisible(False)
+
+            self.hud.setMinimumSize(160, 160)
+            self.setMinimumSize(180, 180)
+
+            # Frameless + Always on Top (Sabse Upar!)
+            self.setWindowFlags(
+                Qt.WindowType.Window |
+                Qt.WindowType.FramelessWindowHint |
+                Qt.WindowType.WindowStaysOnTopHint
+            )
+
+            # Floating widget style: dark HUD circle/box with glowing cyan border
+            self.centralWidget().setStyleSheet(f"""
+                QWidget {{
+                    background: {C.BG};
+                    border: 2px solid {C.PRI};
+                    border-radius: 28px;
+                }}
+            """)
+
+            # Position in bottom-right corner of screen (convenient float location)
+            screen = QApplication.primaryScreen().availableGeometry()
+            w, h = 280, 280
+            x = screen.x() + screen.width() - w - 35
+            y = screen.y() + screen.height() - h - 45
+            self.setGeometry(x, y, w, h)
+
+            if not hasattr(self, "_face_restore_btn"):
+                self._face_restore_btn = QPushButton("🗖", self.centralWidget())
+                self._face_restore_btn.setFixedSize(24, 24)
+                self._face_restore_btn.setToolTip("Restore Full HUD [Double-Click Face or Click Here]")
+                self._face_restore_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                self._face_restore_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {C.PANEL2};
+                        color: {C.PRI};
+                        border: 1px solid {C.PRI_DIM};
+                        border-radius: 12px;
+                        font-size: 11px;
+                        font-weight: bold;
+                    }}
+                    QPushButton:hover {{
+                        background: {C.PRI};
+                        color: {C.BG};
+                    }}
+                """)
+                self._face_restore_btn.clicked.connect(lambda: self.toggle_display_mode("standard"))
+
+            self._face_restore_btn.move(w - 32, 8)
+            self._face_restore_btn.show()
+            self._face_restore_btn.raise_()
+
+            if hasattr(self, "_mode_btn"):
+                self._mode_btn.setToolTip("Restore Full Mode [F10 / Ctrl+M]")
+
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+        elif mode == "standard" and getattr(self, "_is_face_mode", False):
+            self._is_face_mode = False
+
+            if hasattr(self, "_face_restore_btn"):
+                self._face_restore_btn.hide()
+
+            # Normal Window flags
+            self.setWindowFlags(Qt.WindowType.Window)
+
+            # Normal central widget style
+            self.centralWidget().setStyleSheet(f"background: {C.BG};")
+
+            # Restore minimum sizes
+            self.hud.setMinimumSize(300, 300)
+            self.setMinimumSize(_MIN_W, _MIN_H)
+
+            # Restore all panels
+            self._header.setVisible(True)
+            self._left_panel.setVisible(True)
+            self._right_panel.setVisible(True)
+            self._footer.setVisible(True)
+
+            if hasattr(self, "_mode_btn"):
+                self._mode_btn.setToolTip("Toggle Floating Face Mode [F10 / Ctrl+M] (Always on Top)")
+
+            if self._saved_geometry:
+                self.setGeometry(self._saved_geometry)
+            else:
+                self.resize(_DEFAULT_W, _DEFAULT_H)
+
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
     def _toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
@@ -3839,6 +4230,8 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if getattr(self, "_is_face_mode", False) and hasattr(self, "_face_restore_btn") and self._face_restore_btn.isVisible():
+            self._face_restore_btn.move(self.width() - 32, 8)
         cw = self.centralWidget()
         if self._overlay and self._overlay.isVisible():
             ow, oh = 460, 390
@@ -3979,6 +4372,25 @@ class MainWindow(QMainWindow):
         self._ctrl_btn.clicked.connect(self._toggle_controls)
         lay.addSpacing(4)
         lay.addWidget(self._ctrl_btn)
+
+        self._mode_btn = QPushButton("🎭")
+        self._mode_btn.setFixedSize(26, 26)
+        self._mode_btn.setFont(QFont("Courier New", 11))
+        self._mode_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mode_btn.setToolTip("Toggle Floating Face Mode [F10 / Ctrl+M] (Always on Top)")
+        self._mode_btn.setStyleSheet(self._drawer_btn.styleSheet())
+        self._mode_btn.clicked.connect(self.toggle_display_mode)
+        lay.addSpacing(4)
+        lay.addWidget(self._mode_btn)
+        lay.addSpacing(8)
+
+        self._autostart_header_btn = QPushButton("🚀 PC STARTUP: OFF")
+        self._autostart_header_btn.setFixedHeight(26)
+        self._autostart_header_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._autostart_header_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._autostart_header_btn.setToolTip("Toggle auto-start when PC boots (Windows Startup)")
+        self._autostart_header_btn.clicked.connect(self._toggle_autostart)
+        lay.addWidget(self._autostart_header_btn)
         lay.addStretch()
 
         mid = QVBoxLayout(); mid.setSpacing(1)
@@ -4314,6 +4726,9 @@ class MainWindow(QMainWindow):
         self._hud_btn.clicked.connect(self._toggle_hud_style)
         self._refresh_hud_btn()
 
+        self._face_mode_btn = _row(QPushButton("🎭  FLOATING FACE MODE  [F10]"), self._BTN_DIM)
+        self._face_mode_btn.clicked.connect(self.toggle_display_mode)
+
         w.adjustSize()
         return w
 
@@ -4338,6 +4753,7 @@ class MainWindow(QMainWindow):
     def _toggle_drawer(self, checked: bool):
         if checked:
             self._close_controls()
+            self._update_autostart_btn(self._check_autostart())
             self._position_quick_drawer()
             self._quick_drawer.show()
             self._quick_drawer.raise_()
@@ -4953,16 +5369,25 @@ class MainWindow(QMainWindow):
         """Returns True if auto-start is currently registered on this OS."""
         try:
             if _OS == "Windows":
-                import winreg
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                    r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+                import winreg, os
+                found = False
                 try:
-                    winreg.QueryValueEx(key, "JARVIS_AI")
-                    return True
-                except FileNotFoundError:
-                    return False
-                finally:
-                    winreg.CloseKey(key)
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                        r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+                    try:
+                        winreg.QueryValueEx(key, "JARVIS_AI")
+                        found = True
+                    except FileNotFoundError:
+                        found = False
+                    finally:
+                        winreg.CloseKey(key)
+                except Exception:
+                    pass
+                if not found:
+                    startup_dir = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+                    if startup_dir.exists() and any(startup_dir.glob("*jarvis*")):
+                        found = True
+                return found
             elif _OS == "Darwin":
                 return (Path.home() / "Library" / "LaunchAgents"
                         / "com.jarvis.assistant.plist").exists()
@@ -4976,11 +5401,21 @@ class MainWindow(QMainWindow):
         try:
             script = str(Path(__file__).resolve().parent / "main.py")
             if _OS == "Windows":
-                import winreg
+                import winreg, os
                 reg = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                     r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
                 if currently_on:
-                    winreg.DeleteValue(reg, "JARVIS_AI")
+                    try:
+                        winreg.DeleteValue(reg, "JARVIS_AI")
+                    except FileNotFoundError:
+                        pass
+                    try:
+                        startup_dir = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+                        if startup_dir.exists():
+                            for f in startup_dir.glob("*jarvis*"):
+                                f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 else:
                     pythonw = Path(sys.executable).parent / "pythonw.exe"
                     exe = str(pythonw if pythonw.exists() else sys.executable)
@@ -5024,31 +5459,58 @@ class MainWindow(QMainWindow):
             enabled = not currently_on
             self._update_autostart_btn(enabled)
             self._log.append_log(
-                f"SYS: Auto-start {'enabled' if enabled else 'disabled'}.")
+                f"SYS: PC Startup auto-run {'ENABLED' if enabled else 'DISABLED'}.")
         except Exception as e:
             self._log.append_log(f"ERR: Auto-start failed — {e}")
 
     def _update_autostart_btn(self, enabled: bool):
-        if not hasattr(self, '_autostart_btn'):
-            return
-        if enabled:
-            self._autostart_btn.setText("◉  AUTO-START: ON")
-            self._autostart_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: #001a08; color: {C.GREEN};
-                    border: 1px solid {C.GREEN_D}; border-radius: 3px;
-                }}
-                QPushButton:hover {{ background: #002010; }}
-            """)
-        else:
-            self._autostart_btn.setText("◉  AUTO-START: OFF")
-            self._autostart_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: transparent; color: {C.TEXT_DIM};
-                    border: 1px solid {C.BORDER}; border-radius: 3px;
-                }}
-                QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
-            """)
+        # Update header bar button
+        if hasattr(self, '_autostart_header_btn'):
+            if enabled:
+                self._autostart_header_btn.setText("🚀 PC STARTUP: ON")
+                self._autostart_header_btn.setToolTip("Auto-start with Windows is ON. Click to turn OFF.")
+                self._autostart_header_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: #00220d; color: {C.GREEN};
+                        border: 1px solid {C.GREEN_D}; border-radius: 4px;
+                        padding: 0 10px; font-weight: bold;
+                    }}
+                    QPushButton:hover {{ background: #003615; border-color: {C.GREEN}; }}
+                """)
+            else:
+                self._autostart_header_btn.setText("🚀 PC STARTUP: OFF")
+                self._autostart_header_btn.setToolTip("Auto-start with Windows is OFF. Click to turn ON.")
+                self._autostart_header_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: transparent; color: {C.TEXT_DIM};
+                        border: 1px solid {C.BORDER}; border-radius: 4px;
+                        padding: 0 10px; font-weight: bold;
+                    }}
+                    QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; background: rgba(255,255,255,0.03); }}
+                """)
+
+        # Update quick drawer button
+        if hasattr(self, '_autostart_btn'):
+            if enabled:
+                self._autostart_btn.setText("◉  AUTO-START: ON")
+                self._autostart_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: #001a08; color: {C.GREEN};
+                        border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                        text-align: left; padding: 0 8px;
+                    }}
+                    QPushButton:hover {{ background: #002010; border-color: {C.GREEN}; }}
+                """)
+            else:
+                self._autostart_btn.setText("◉  AUTO-START: OFF")
+                self._autostart_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: transparent; color: {C.TEXT_DIM};
+                        border: 1px solid {C.BORDER}; border-radius: 3px;
+                        text-align: left; padding: 0 8px;
+                    }}
+                    QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
+                """)
 
     def _toggle_brief(self):
         from memory.config_manager import get_brief_enabled, save_brief_enabled
@@ -5278,7 +5740,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, '_brief_btn'):
             return
         if enabled:
-            self._brief_btn.setText("☀  MORNING BRIEF: ON")
+            self._brief_btn.setText("☀  GREETING: ON")
             self._brief_btn.setStyleSheet(f"""
                 QPushButton {{
                     background: #001a08; color: {C.GREEN};
@@ -5288,7 +5750,7 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ background: #002010; }}
             """)
         else:
-            self._brief_btn.setText("☀  MORNING BRIEF: OFF")
+            self._brief_btn.setText("☀  GREETING: OFF")
             self._brief_btn.setStyleSheet(f"""
                 QPushButton {{
                     background: transparent; color: {C.TEXT_DIM};
@@ -5373,6 +5835,7 @@ class MainWindow(QMainWindow):
                 self._log.append_log(f"SYS: UI colour applied — {ui_color}")
             if voice_changed:
                 self._log.append_log(f"SYS: Voice set — {voice}")
+                self.hud.update_avatar_variant()
         except Exception as e:
             self._log.append_log(f"ERR: Config save failed — {e}")
 
@@ -5847,3 +6310,23 @@ class JarvisUI:
     def stop_speaking(self):
         if not self.muted:
             self.set_state("LISTENING")
+
+    def toggle_display_mode(self, mode: str | None = None) -> str:
+        return self._win.toggle_display_mode(mode)
+
+    @property
+    def is_face_mode(self) -> bool:
+        return getattr(self._win, "_is_face_mode", False)
+
+    def toggle_autostart(self) -> bool:
+        self._win._toggle_autostart()
+        return self._win._check_autostart()
+
+    def set_autostart(self, enabled: bool) -> bool:
+        current = self._win._check_autostart()
+        if current != enabled:
+            self._win._toggle_autostart()
+        return self._win._check_autostart()
+
+    def get_autostart(self) -> bool:
+        return self._win._check_autostart()

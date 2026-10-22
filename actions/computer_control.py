@@ -7,6 +7,14 @@ import string
 import subprocess
 import sys
 
+for _stream in ("stdout", "stderr"):
+    try:
+        _s = getattr(sys, _stream, None)
+        if _s is not None and hasattr(_s, "reconfigure"):
+            _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 if platform.system() == "Windows":
     _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
 else:
@@ -17,7 +25,7 @@ from pathlib import Path
 
 try:
     import pyautogui
-    pyautogui.FAILSAFE = True
+    pyautogui.FAILSAFE = False
     pyautogui.PAUSE    = 0.05
     _PYAUTOGUI = True
 except ImportError:
@@ -28,6 +36,13 @@ try:
     _PYPERCLIP = True
 except ImportError:
     _PYPERCLIP = False
+
+try:
+    import PIL.Image
+    import PIL.ImageGrab
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -154,10 +169,21 @@ def _user_profile() -> dict:
         pass
     return {}
 
+def _paste_or_type(text: str) -> None:
+    _require_pyautogui()
+    if _PYPERCLIP:
+        pyperclip.copy(text)
+        time.sleep(0.08)
+        paste_key = "command" if _get_os() == "mac" else "ctrl"
+        pyautogui.hotkey(paste_key, "v")
+        time.sleep(0.08)
+    else:
+        pyautogui.typewrite(text, interval=0.03)
+
 def _type(text: str, interval: float = 0.03) -> str:
     _require_pyautogui()
-    time.sleep(0.3)
-    pyautogui.typewrite(text, interval=interval)
+    time.sleep(0.2)
+    _paste_or_type(text)
     return f"Typed: {text[:60]}{'…' if len(text) > 60 else ''}"
 
 
@@ -166,15 +192,7 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
     if clear_first:
         _clear_field()
         time.sleep(0.1)
-
-    if len(text) > 20 and _PYPERCLIP:
-        pyperclip.copy(text)
-        time.sleep(0.1)
-        paste_key = "command" if _get_os() == "mac" else "ctrl"
-        pyautogui.hotkey(paste_key, "v")
-        return f"Smart-typed (clipboard): {text[:60]}{'…' if len(text) > 60 else ''}"
-
-    pyautogui.typewrite(text, interval=0.04)
+    _paste_or_type(text)
     return f"Smart-typed: {text[:60]}{'…' if len(text) > 60 else ''}"
 
 
@@ -239,12 +257,70 @@ def _clipboard_paste(text: str) -> str:
     return "pyperclip not available"
 
 
+def _capture_screen_image():
+    """
+    Capture the current desktop screen safely across platforms and Windows DPI contexts.
+    Tries PyQt6 QScreen, mss, PIL.ImageGrab, and PyAutoGUI in order.
+    """
+    # 1. PyQt6 QScreen (best fidelity inside GUI app)
+    try:
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import QBuffer, QIODevice
+        import PIL.Image
+        app = QApplication.instance()
+        if not app:
+            import sys
+            app = QApplication(sys.argv if hasattr(sys, 'argv') and sys.argv else ["jarvis"])
+        if app:
+            screen = app.primaryScreen()
+            if screen:
+                pix = screen.grabWindow(0)
+                if not pix.isNull() and pix.width() > 100:
+                    buf = QBuffer()
+                    buf.open(QIODevice.OpenModeFlag.ReadWrite)
+                    pix.save(buf, "PNG")
+                    raw = bytes(buf.data())
+                    if len(raw) > 1000:
+                        im = PIL.Image.open(io.BytesIO(raw)).convert("RGB")
+                        return im
+    except Exception:
+        pass
+
+    # 2. mss (direct display capture)
+    try:
+        import mss
+        import PIL.Image
+        with mss.mss() as sct:
+            mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            shot = sct.grab(mon)
+            return PIL.Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    except Exception:
+        pass
+
+    # 3. PIL.ImageGrab
+    try:
+        import PIL.ImageGrab
+        return PIL.ImageGrab.grab(all_screens=True).convert("RGB")
+    except Exception:
+        pass
+
+    # 4. pyautogui
+    try:
+        if _PYAUTOGUI:
+            return pyautogui.screenshot().convert("RGB")
+    except Exception:
+        pass
+
+    return None
+
+
 def _screenshot(save_path: str | None = None) -> str:
-    _require_pyautogui()
     path = _safe_screenshot_path(save_path)
-    img  = pyautogui.screenshot()
-    img.save(str(path))
-    return f"Screenshot saved: {path}"
+    img  = _capture_screen_image()
+    if img:
+        img.save(str(path))
+        return f"Screenshot saved: {path}"
+    return "Failed to capture screenshot."
 
 
 def _clear_field() -> str:
@@ -311,47 +387,108 @@ def _focus_window(title: str) -> str:
     return f"focus_window: unknown OS '{os_name}'"
 
 def _screen_find(description: str) -> tuple[int, int] | None:
-    api_key = _get_api_key()
+    from core import gemini
+    api_key = gemini.api_key() or _get_api_key()
     if not api_key:
-        print("[ComputerControl] ⚠️ No API key for screen_find")
+        print("[ComputerControl] [!] No API key for screen_find")
         return None
 
     try:
-        from google import genai
         from google.genai import types as gtypes
+        import PIL.Image
 
         _require_pyautogui()
-        w, h  = pyautogui.size()
-        img   = pyautogui.screenshot()
-        buf   = io.BytesIO()
-        img.save(buf, format="PNG")
+        screen_w, screen_h = pyautogui.size()
+
+        img = _capture_screen_image()
+        if img is None:
+            print("[ComputerControl] [!] Could not capture screen for screen_find")
+            return None
+
+        orig_w, orig_h = img.size
+
+        # Downscale copy for fast upload & low network latency
+        im_send = img.copy()
+        im_send.thumbnail((1280, 720), PIL.Image.Resampling.BILINEAR)
+        send_w, send_h = im_send.size
+
+        scale_x = orig_w / float(send_w)
+        scale_y = orig_h / float(send_h)
+
+        buf = io.BytesIO()
+        im_send.save(buf, format="JPEG", quality=85)
         image_bytes = buf.getvalue()
 
         prompt = (
-            f"This is a screenshot of a {w}×{h} pixel screen. "
-            f"Locate the UI element described as: '{description}'. "
-            f"Reply with ONLY the center coordinates as: x,y "
-            f"If the element is not visible, reply: NOT_FOUND"
+            f"You are an expert GUI visual grounding agent. Locate the UI element on this screen matching: '{description}'.\n"
+            f"Rules:\n"
+            f"1. Accurately identify the bounding box enclosing '{description}' (button, video thumbnail/title, search box, link, chat/contact, icon, or menu item).\n"
+            f"2. Return ONLY the bounding box in normalized [0, 1000] format: [ymin, xmin, ymax, xmax]\n"
+            f"   Example: [420, 310, 480, 550]\n"
+            f"3. Do NOT output any markdown, explanations, or words. Output ONLY the bracketed box [ymin, xmin, ymax, xmax].\n"
+            f"4. If the target element is definitely not visible anywhere on screen, reply ONLY: NOT_FOUND"
         )
 
-        from core import gemini
-        response = gemini.call(
-            [gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"), prompt],
-            tier=gemini.FAST, timeout_ms=20_000,
+        client = gemini.client(timeout_ms=15000, key=api_key)
+        vision_models = (
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-flash-lite-latest",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash",
         )
-        if response is None:
+
+        resp_text = ""
+        for model_name in vision_models:
+            try:
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        gtypes.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                        prompt
+                    ]
+                )
+                if resp and resp.text:
+                    resp_text = resp.text.strip()
+                    if resp_text:
+                        break
+            except Exception as me:
+                print(f"[ComputerControl] Vision model {model_name} warning: {me}")
+
+        if not resp_text or "NOT_FOUND" in resp_text.upper():
+            print(f"[ComputerControl] Element '{description}' not found by vision model")
             return None
 
-        text = (response.text or "").strip()
-        if "NOT_FOUND" in text.upper():
-            return None
+        # 1. Parse standard box_2d [ymin, xmin, ymax, xmax] on normalized 0-1000 scale
+        box_m = re.search(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]', resp_text)
+        if box_m:
+            y1, x1, y2, x2 = map(float, box_m.groups())
+            norm_x = (x1 + x2) / 2000.0
+            norm_y = (y1 + y2) / 2000.0
+            py_x = int(round(norm_x * screen_w))
+            py_y = int(round(norm_y * screen_h))
+            py_x = max(0, min(screen_w - 1, py_x))
+            py_y = max(0, min(screen_h - 1, py_y))
+            print(f"[ComputerControl] Found '{description}' box [{int(y1)},{int(x1)},{int(y2)},{int(x2)}] -> center ({py_x}, {py_y}) (screen {screen_w}x{screen_h})")
+            return py_x, py_y
 
-        match = re.search(r"(\d+)\s*,\s*(\d+)", text)
-        if match:
-            return int(match.group(1)), int(match.group(2))
+        # 2. Fallback point search
+        pt_m = re.search(r'(\d+)\s*,\s*(\d+)', resp_text)
+        if pt_m:
+            v1, v2 = float(pt_m.group(1)), float(pt_m.group(2))
+            if v1 <= 1000 and v2 <= 1000:
+                py_x = int(round((v1 / 1000.0) * screen_w))
+                py_y = int(round((v2 / 1000.0) * screen_h))
+            else:
+                py_x = int(round(v1 * (screen_w / float(orig_w))))
+                py_y = int(round(v2 * (screen_h / float(orig_h))))
+            py_x = max(0, min(screen_w - 1, py_x))
+            py_y = max(0, min(screen_h - 1, py_y))
+            print(f"[ComputerControl] Found '{description}' point -> ({py_x}, {py_y})")
+            return py_x, py_y
 
     except Exception as e:
-        print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
+        print(f"[ComputerControl] screen_find failed: {e}")
 
     return None
 
@@ -426,15 +563,53 @@ def computer_control(
             )
 
         if action in ("click", "left_click"):
+            desc = params.get("description", "")
+            if desc:
+                coords = _screen_find(desc)
+                if coords:
+                    time.sleep(0.15)
+                    _move(coords[0], coords[1], duration=0.2)
+                    time.sleep(0.08)
+                    _click(x=coords[0], y=coords[1], button="left", clicks=1)
+                    return f"Successfully clicked '{desc}' at coordinates ({coords[0]}, {coords[1]})."
+                return f"[FAILED] Element '{desc}' was not found on screen."
             return _click(params.get("x"), params.get("y"), "left", 1)
 
-        if action == "double_click":
+        if action in ("double_click", "screen_double_click"):
+            desc = params.get("description", "")
+            if desc:
+                coords = _screen_find(desc)
+                if coords:
+                    time.sleep(0.15)
+                    _move(coords[0], coords[1], duration=0.2)
+                    time.sleep(0.08)
+                    _click(x=coords[0], y=coords[1], button="left", clicks=2)
+                    return f"Successfully double-clicked '{desc}' at coordinates ({coords[0]}, {coords[1]})."
+                return f"[FAILED] Element '{desc}' was not found on screen for double-click."
             return _click(params.get("x"), params.get("y"), "left", 2)
 
-        if action == "right_click":
+        if action in ("right_click", "screen_right_click"):
+            desc = params.get("description", "")
+            if desc:
+                coords = _screen_find(desc)
+                if coords:
+                    time.sleep(0.15)
+                    _move(coords[0], coords[1], duration=0.2)
+                    time.sleep(0.08)
+                    _click(x=coords[0], y=coords[1], button="right", clicks=1)
+                    return f"Successfully right-clicked '{desc}' at coordinates ({coords[0]}, {coords[1]})."
+                return f"[FAILED] Element '{desc}' was not found on screen for right-click."
             return _click(params.get("x"), params.get("y"), "right", 1)
 
-        if action == "move":
+        if action in ("hover", "mouse_over"):
+            desc = params.get("description", "")
+            if desc:
+                coords = _screen_find(desc)
+                if coords:
+                    time.sleep(0.15)
+                    _move(coords[0], coords[1], duration=0.2)
+                    return f"Moved mouse over '{desc}' at coordinates ({coords[0]}, {coords[1]})."
+                return f"[FAILED] Element '{desc}' was not found on screen to hover."
             return _move(int(params.get("x", 0)), int(params.get("y", 0)))
 
         if action == "drag":
@@ -472,12 +647,16 @@ def computer_control(
 
         if action == "screen_click":
             desc   = params.get("description", "")
+            if not desc:
+                return "[FAILED] No element description provided for screen_click."
             coords = _screen_find(desc)
             if coords:
-                time.sleep(0.2)
+                time.sleep(0.15)
+                _move(coords[0], coords[1], duration=0.2)
+                time.sleep(0.08)
                 _click(x=coords[0], y=coords[1])
-                return f"Clicked '{desc}' at {coords}"
-            return f"Element not found on screen: '{desc}'"
+                return f"Successfully clicked '{desc}' at coordinates ({coords[0]}, {coords[1]})."
+            return f"[FAILED] Element '{desc}' was not found on screen. It might be off-screen, minimized, covered by another window, or still loading."
 
         if action == "wait":
             secs = float(params.get("seconds", 1.0))
@@ -516,13 +695,13 @@ def computer_control(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "computer_control",
-    "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+    "description": "Direct computer control: type, click, right_click, double_click, hover, hotkeys, scroll, move mouse, screenshots, find and click elements on screen. Use action='screen_click', 'right_click', 'double_click', or 'hover' with 'description' to visually find and interact with any message, button, menu, video, tab, or UI element on screen.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"
+                "description": "type | smart_type | click | double_click | right_click | hover | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"
             },
             "text": {
                 "type": "STRING",
@@ -562,7 +741,7 @@ TOOL = {
             },
             "description": {
                 "type": "STRING",
-                "description": "Element description for screen_find/screen_click"
+                "description": "Description of the element, video, thumbnail, button, or link to find or click on screen."
             },
             "type": {
                 "type": "STRING",

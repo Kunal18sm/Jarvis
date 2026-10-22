@@ -90,16 +90,28 @@ def _resolve_youtube(url_or_query: str) -> tuple[str, str, str, str]:
                             "cannot be played inside the HUD. "
                             "Run: pip install yt-dlp")
 
-    query = url_or_query if _YT.search(url_or_query) else f"ytsearch1:{url_or_query}"
+    query = url_or_query if _YT.search(url_or_query) else f"ytsearch5:{url_or_query}"
     # No "format" here on purpose: ask for everything and choose below, so a
     # video that lacks whatever was requested cannot fail outright.
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
-            "noplaylist": True}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "ignoreerrors": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web", "mweb"]}},
+    }
+    info = None
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-        if info and info.get("entries"):
-            info = info["entries"][0]
+            res = ydl.extract_info(query, download=False)
+        if res and res.get("entries"):
+            for entry in res["entries"]:
+                if entry and entry.get("formats"):
+                    info = entry
+                    break
+        elif res and res.get("formats"):
+            info = res
         if not info:
             return "", "", "", "nothing was found for that."
     except Exception as e:
@@ -201,29 +213,17 @@ def video_player(parameters: dict = None, response=None, player=None,
 
     local = _local_path(source)
     if local:
-        player.show_video(local, Path(local).name, muted=True)
-        return f"Playing {Path(local).name} on the display, muted."
+        player.show_video(local, Path(local).name, muted=False)
+        return f"Playing {Path(local).name} on the display."
 
     # A direct media URL can go straight to the player; a YouTube page cannot.
     if _is_url(source) and not _YT.search(source):
-        player.show_video(source, source.rsplit("/", 1)[-1][:44], muted=True)
-        return "Playing that on the display, muted."
+        player.show_video(source, source.rsplit("/", 1)[-1][:44], muted=False)
+        return "Playing that on the display."
 
     # ANSWER FIRST, OPEN SECOND.
-    #
-    # Working out what to play takes seconds that nothing can remove: measured
-    # against YouTube, 3.3s for a spoken phrase (a search, then the video) and
-    # 2.0s for a link, plus however long Qt spends buffering before the first
-    # frame. Restricting yt-dlp to a lighter client was tried and is not the
-    # answer — the fast clients came back with zero usable formats.
-    #
-    # So the seconds stay, and what changes is where the user spends them:
-    # listening to JARVIS say it is coming, instead of watching nothing happen.
-    # The same shape whatsapp_call uses, and for the same reason.
     threading.Thread(target=_play_youtube, args=(player, source, _begin_open()),
                      daemon=True, name="video-open").start()
-    # Deliberately a status line rather than a finished English sentence: the
-    # model writes the words, in the user's own language.
     return f"status=opening source={source}"
 
 
@@ -242,7 +242,7 @@ def _play_youtube(player, source: str, token: int) -> None:
 
     if url:
         try:
-            player.show_video(url, title or source, muted=True,
+            player.show_video(url, title or source, muted=False,
                               audio_source=audio_url)
             return
         except Exception as e:                              # noqa: BLE001
@@ -275,23 +275,15 @@ def _say(player, instruction: str) -> None:
 TOOL = {
     "name": "video_player",
     "description": (
-        "If user wants to open a video on YouTube, he will tell you that specifically"
-        "If user wants to play a video, then he wants to call this feature"
-        "Plays a VIDEO on the assistant's own display, where the avatar "
+        "Plays a VIDEO or SONG/MUSIC on the assistant's own display, where the avatar "
         "normally is — and stops it, mutes it or unmutes it. Use whenever the "
-        "user wants to WATCH something on screen: 'play the new Dune trailer', "
-        "'şu videoyu oynat', 'play C:/clips/holiday.mp4', 'put that YouTube "
-        "video on the screen', 'stop the video', 'videoyu kapat', 'turn the "
-        "sound on', 'sesi aç', 'mute it'. Accepts a local file path, a direct "
-        "video URL, a YouTube link, or a description to search YouTube for. "
-        "Video always starts MUTED — only call action='unmute' when the user "
-        "actually asks to hear it. "
+        "user wants to listen to music, play a song, or watch a video: 'play believer', "
+        "'song chalao', 'koi gana bajao', 'play music', 'play the new Dune trailer', 'stop the video', "
+        "'turn sound on', 'mute it'. Accepts a song/video name to search YouTube for, a YouTube link, "
+        "a direct video URL, or a local file path. Media plays with sound on. "
         "This returns the moment it is asked, before the picture appears: when "
-        "it answers 'status=opening', say in one short sentence that you are "
-        "putting it on the display, and do not wait or call it again. "
-        "Do NOT use 'youtube_video' for this: that optional plugin opens videos "
-        "in the web browser and summarises transcripts, it never plays anything "
-        "on the assistant's display."
+        "it answers 'status=opening', say in one short sentence in user's language that you are "
+        "playing it on the display, and do not wait or call it again."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -305,9 +297,8 @@ TOOL = {
             "source": {
                 "type": "STRING",
                 "description": (
-                    "For action='play': a local file path, a direct video URL, "
-                    "a YouTube link, or what to search YouTube for. Pass what "
-                    "the user actually named, in their own words."
+                    "For action='play': song name, video title, YouTube search query, YouTube link, "
+                    "direct video URL, or local file path."
                 ),
             },
         },

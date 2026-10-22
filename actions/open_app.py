@@ -1,7 +1,16 @@
+import sys
 import time
 import subprocess
 import platform
 import shutil
+
+for _stream in ("stdout", "stderr"):
+    try:
+        _s = getattr(sys, _stream, None)
+        if _s is not None and hasattr(_s, "reconfigure"):
+            _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 try:
     import psutil
@@ -20,7 +29,7 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "brave":              {"Windows": "brave",                   "Darwin": "Brave Browser",        "Linux": "brave-browser"},
     "safari":             {"Windows": "msedge",                  "Darwin": "Safari",               "Linux": "firefox"},
     "opera":              {"Windows": "opera",                   "Darwin": "Opera",                "Linux": "opera"},
-    "whatsapp":           {"Windows": "WhatsApp",                "Darwin": "WhatsApp",             "Linux": "whatsapp"},
+    "whatsapp":           {"Windows": "whatsapp:",               "Darwin": "WhatsApp",             "Linux": "whatsapp"},
     "telegram":           {"Windows": "Telegram",                "Darwin": "Telegram",             "Linux": "telegram"},
     "discord":            {"Windows": "Discord",                 "Darwin": "Discord",              "Linux": "discord"},
     "slack":              {"Windows": "Slack",                   "Darwin": "Slack",                "Linux": "slack"},
@@ -77,8 +86,87 @@ def _normalize(raw: str) -> str:
 
     return raw  
 
-def _launch_windows(app_name: str) -> bool:
+def _is_app_running(target: str) -> bool:
+    if not _PSUTIL:
+        return True
+    target_clean = target.lower().replace(".exe", "").replace(":", "").strip()
+    if not target_clean:
+        return False
+    process_aliases = {
+        "whatsapp": ["whatsapp", "whatsapp.root"],
+        "chrome": ["chrome"],
+        "google chrome": ["chrome"],
+        "edge": ["msedge"],
+        "firefox": ["firefox"],
+        "vscode": ["code"],
+        "code": ["code"],
+        "spotify": ["spotify"],
+        "telegram": ["telegram"],
+        "discord": ["discord"],
+        "notepad": ["notepad"],
+        "calculator": ["calc", "calculatorapp"],
+        "cmd": ["cmd"],
+        "terminal": ["windowsterminal", "wt"],
+        "powershell": ["powershell", "pwsh"],
+        "explorer": ["explorer"],
+        "paint": ["mspaint"],
+        "word": ["winword"],
+        "excel": ["excel"],
+        "powerpoint": ["powerpnt"],
+    }
+    match_names = process_aliases.get(target_clean, [target_clean])
+    try:
+        for p in psutil.process_iter(['name']):
+            p_name = (p.info.get('name') or '').lower()
+            if any(m in p_name for m in match_names):
+                return True
+    except Exception:
+        pass
+    return False
 
+
+def _launch_windows(app_name: str) -> bool:
+    pids_before = {p.pid for p in psutil.process_iter(['pid'])} if _PSUTIL else set()
+
+    # 1. Real Chrome launch
+    clean_app = app_name.lower().strip()
+    if "chrome" in clean_app:
+        profile_query = None
+        for word in clean_app.replace("chrome", "").replace("google", "").replace("exe", "").replace("profile", "").split():
+            if word not in ("open", "kholo", "in", "me", "ki", "wali"):
+                profile_query = word
+                break
+        try:
+            from actions.browser_control import _open_native
+            res = _open_native("", "chrome", profile=profile_query)
+            if "Opened" in res:
+                time.sleep(1.2)
+                return _is_app_running("chrome")
+        except Exception:
+            pass
+
+    # 2. Web URLs
+    if app_name.startswith("http://") or app_name.startswith("https://"):
+        try:
+            from actions.browser_control import _navigate_current_tab, _open_native
+            if _navigate_current_tab(app_name, "chrome"):
+                return True
+            res = _open_native(app_name, "chrome")
+            return "Opened" in res
+        except Exception as e:
+            print(f"[open_app] web url launch failed: {e}")
+
+    # 3. Native WhatsApp protocol
+    if app_name.lower().strip() in ("whatsapp", "whatsapp:"):
+        try:
+            subprocess.Popen("start whatsapp:", shell=True)
+            time.sleep(2.0)
+            if _is_app_running("whatsapp"):
+                return True
+        except Exception as e:
+            print(f"[open_app] whatsapp protocol launch failed: {e}")
+
+    # 4. PATH binary
     if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
         try:
             subprocess.Popen(
@@ -87,29 +175,42 @@ def _launch_windows(app_name: str) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            time.sleep(1.5)
-            return True
+            time.sleep(1.8)
+            pids_after = {p.pid for p in psutil.process_iter(['pid'])} if _PSUTIL else set()
+            if (pids_after - pids_before) or _is_app_running(app_name):
+                return True
         except Exception as e:
             print(f"[open_app] subprocess failed: {e}")
 
+    # 5. Windows protocol (e.g. ms-settings:, calc:)
     if ":" in app_name:
         try:
             subprocess.Popen(f"start {app_name}", shell=True)
-            time.sleep(1.0)
-            return True
+            time.sleep(1.8)
+            pids_after = {p.pid for p in psutil.process_iter(['pid'])} if _PSUTIL else set()
+            if (pids_after - pids_before) or _is_app_running(app_name):
+                return True
         except Exception:
             pass
 
+    # 6. Windows Start Menu search & launch with verification
     try:
         import pyautogui
         pyautogui.PAUSE = 0.1
         pyautogui.press("win")
-        time.sleep(0.7)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.9)
+        time.sleep(0.6)
+        clean_search = app_name.replace(":", "").strip()
+        pyautogui.write(clean_search, interval=0.04)
+        time.sleep(0.8)
         pyautogui.press("enter")
         time.sleep(2.5)
-        return True
+
+        # Verify whether app actually launched or is running
+        pids_after = {p.pid for p in psutil.process_iter(['pid'])} if _PSUTIL else set()
+        if (pids_after - pids_before) or _is_app_running(app_name):
+            return True
+        # If no new PID and app is not running, dismiss any open Start Menu window
+        pyautogui.press("esc")
     except Exception as e:
         print(f"[open_app] Start Menu search failed: {e}")
 
@@ -253,7 +354,7 @@ def open_app(
         return f"Unsupported operating system: {_SYSTEM}"
 
     normalized = _normalize(app_name)
-    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+    print(f"[open_app] Launching: '{app_name}' -> '{normalized}' ({_SYSTEM})")
 
     if player:
         player.write_log(f"[open_app] {app_name}")
@@ -265,12 +366,12 @@ def open_app(
             if launcher(app_name):
                 return f"Opened {app_name}."
         return (
-            f"Could not confirm that {app_name} launched. "
-            f"It may still be loading, or it might not be installed."
+            f"[FAILED] Could not confirm that '{app_name}' launched. "
+            f"The application was not found, failed to start, or is not installed on this PC."
         )
     except Exception as e:
         print(f"[open_app] Error: {e}")
-        return f"Failed to open {app_name}: {e}"
+        return f"[FAILED] Failed to open '{app_name}': {e}"
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────

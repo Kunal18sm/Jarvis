@@ -7,10 +7,21 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import threading
+import time
 import webbrowser
+import json
 from pathlib import Path
 from typing import Optional
+
+for _stream in ("stdout", "stderr"):
+    try:
+        _s = getattr(sys, _stream, None)
+        if _s is not None and hasattr(_s, "reconfigure"):
+            _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from playwright.async_api import (
     async_playwright,
@@ -20,6 +31,174 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeout,
 )
 _OS = platform.system()   # "Windows" | "Darwin" | "Linux"
+
+def _base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent.parent
+
+_CONFIG_PATH = _base_dir() / "config" / "api_keys.json"
+
+def _load_app_config() -> dict:
+    try:
+        if _CONFIG_PATH.exists():
+            return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_app_config(cfg: dict) -> None:
+    try:
+        _CONFIG_PATH.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+    except Exception as e:
+        print(f"[Browser] Error saving config: {e}")
+
+def _chrome_user_data_path() -> Optional[Path]:
+    local = os.environ.get("LOCALAPPDATA", "")
+    home = Path.home()
+    if _OS == "Windows":
+        p = Path(local) / "Google" / "Chrome" / "User Data"
+        return p if p.exists() else None
+    elif _OS == "Darwin":
+        p = home / "Library" / "Application Support" / "Google" / "Chrome"
+        return p if p.exists() else None
+    elif _OS == "Linux":
+        p = home / ".config" / "google-chrome"
+        return p if p.exists() else None
+    return None
+
+def _list_chrome_profiles() -> list[dict]:
+    ud = _chrome_user_data_path()
+    if not ud:
+        return []
+    local_state_file = ud / "Local State"
+    if not local_state_file.exists():
+        return []
+    try:
+        data = json.loads(local_state_file.read_text(encoding="utf-8", errors="ignore"))
+        info_cache = data.get("profile", {}).get("info_cache", {})
+        last_used = data.get("profile", {}).get("last_used", "")
+        last_active = data.get("profile", {}).get("last_active_profiles", [])
+        
+        cfg = _load_app_config()
+        configured = cfg.get("chrome_profile", "").strip()
+
+        profiles = []
+        for p_dir, p_info in info_cache.items():
+            name = p_info.get("name", p_dir)
+            email = p_info.get("user_name", "")
+            is_active = (p_dir == last_used) or (p_dir in last_active)
+            is_selected = (p_dir.lower() == configured.lower()) if configured else is_active
+
+            profiles.append({
+                "directory": p_dir,
+                "name": name,
+                "email": email,
+                "is_active": is_active,
+                "is_selected": is_selected,
+            })
+        return profiles
+    except Exception as e:
+        print(f"[Browser] Error reading Chrome Local State: {e}")
+        return []
+
+def _resolve_chrome_profile(query: Optional[str]) -> Optional[dict]:
+    profiles = _list_chrome_profiles()
+    if not profiles:
+        return None
+    if not query:
+        cfg = _load_app_config()
+        configured = cfg.get("chrome_profile", "").strip()
+        if configured:
+            for p in profiles:
+                if p["directory"].lower() == configured.lower():
+                    return p
+        for p in profiles:
+            if p.get("is_active"):
+                return p
+        return profiles[0]
+
+    q = str(query).lower().strip()
+    # 1. Exact directory match (e.g. "Profile 1", "Default")
+    for p in profiles:
+        if p["directory"].lower() == q:
+            return p
+    # 2. Email match (e.g. "kunal.81789vishu@gmail.com")
+    for p in profiles:
+        if p["email"].lower() == q or q in p["email"].lower():
+            return p
+    # 3. Name match (e.g. "Kunal", "Yash")
+    for p in profiles:
+        if p["name"].lower() == q:
+            return p
+    for p in profiles:
+        if q in p["name"].lower():
+            return p
+    return None
+
+def _get_selected_chrome_profile() -> str:
+    res = _resolve_chrome_profile(None)
+    return res["directory"] if res else "Default"
+
+def _set_selected_chrome_profile(query: str, launch: bool = True) -> str:
+    res = _resolve_chrome_profile(query)
+    if not res:
+        profiles = _list_chrome_profiles()
+        available = ", ".join(f"{p['name']} ({p['email'] or p['directory']})" for p in profiles)
+        return f"[FAILED] Profile '{query}' not found. Available profiles: {available}"
+    cfg = _load_app_config()
+    cfg["chrome_profile"] = res["directory"]
+    _save_app_config(cfg)
+
+    if launch:
+        launch_res = _open_native("", "chrome", profile=res["directory"])
+        time.sleep(1.5)
+        # Verify if Chrome process is running
+        try:
+            import psutil
+            chrome_running = any("chrome" in (p.name() or "").lower() for p in psutil.process_iter(['name']))
+        except Exception:
+            chrome_running = "Opened" in launch_res
+
+        if chrome_running:
+            return f"Opened Chrome successfully with profile '{res['name']}' ({res['email'] or res['directory']})."
+        else:
+            return f"[FAILED] Could not confirm that Chrome opened with profile '{res['name']}'."
+
+    return f"Active Chrome profile set to: {res['name']} ({res['email']}) [{res['directory']}]."
+
+def _sync_chrome_profile(p_dir: str) -> None:
+    """
+    Copies Local State and accessible profile configuration to .jarvis_profiles/chrome
+    so that automation launches inherit the user's accounts and setup.
+    """
+    ud = _chrome_user_data_path()
+    if not ud:
+        return
+    dst_root = Path.home() / ".jarvis_profiles" / "chrome"
+    dst_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        shutil.copy2(ud / "Local State", dst_root / "Local State")
+    except Exception:
+        pass
+
+    src_p = ud / p_dir
+    dst_p = dst_root / p_dir
+    dst_p.mkdir(parents=True, exist_ok=True)
+
+    items_to_copy = [
+        "Preferences", "Secure Preferences", "Bookmarks", "Favicons",
+        "History", "Web Data", "Login Data", "Cookies"
+    ]
+    for item in items_to_copy:
+        src_item = src_p / item
+        if src_item.exists():
+            try:
+                shutil.copy2(src_item, dst_p / item)
+            except Exception:
+                pass
+
 
 def _normalize_url(url: str) -> str:
     """
@@ -104,12 +283,12 @@ def _real_profile_dir(browser: str) -> str:
 
     for p in candidates:
         if p.exists():
-            print(f"[Browser] ✅ Real profile found for {browser}: {p}")
+            print(f"[Browser] [OK] Real profile found for {browser}: {p}")
             return str(p)
 
     fallback = home / ".jarvis_profiles" / browser
     fallback.mkdir(parents=True, exist_ok=True)
-    print(f"[Browser] ⚠️  Real profile not found for {browser}, using: {fallback}")
+    print(f"[Browser] [!] Real profile not found for {browser}, using: {fallback}")
     return str(fallback)
 
 def _firefox_profile_dir() -> Optional[str]:
@@ -276,7 +455,7 @@ def _resolve_browser(name: str) -> dict | None:
     if spec.get("special") == "opera_windows":
         exe = _find_opera_windows()
         if not exe:
-            print(f"[Browser] ⚠️  Opera executable not found on Windows.")
+            print(f"[Browser] [!] Opera executable not found on Windows.")
         return {"engine": engine, "exe": exe, "channel": channel}
 
     for b in bins:
@@ -367,7 +546,7 @@ _MAC_APP_NAMES: dict[str, str] = {
 _WIN_EXE_HINTS: dict[str, str] = {"chrome": "chrome", "edge": "msedge"}
 
 
-def _open_native(url: str, browser_name: Optional[str]) -> str:
+def _open_native(url: str, browser_name: Optional[str] = None, profile: Optional[str] = None) -> str:
     """
     Opens the user's REAL browser normally — with their own profile,
     logged-in accounts and extensions. No automation attaches, so an
@@ -383,19 +562,33 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
     name = None
     if browser_name:
         name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
-    elif not url:
-        # No URL → only a window will open; needs the default browser's exe
+    else:
         name = _detect_default_browser()
+
+    target_profile_dir = None
+    target_profile_name = ""
+    if name == "chrome":
+        resolved_p = _resolve_chrome_profile(profile)
+        if resolved_p:
+            target_profile_dir = resolved_p["directory"]
+            target_profile_name = resolved_p["name"]
+        else:
+            target_profile_dir = _get_selected_chrome_profile()
 
     # Specific browser → launch its own executable, exactly like the user would.
     if name:
         if _OS == "Darwin":
             app = _MAC_APP_NAMES.get(name)
             if app:
-                cmd = ["open", "-a", app] + ([url] if url else [])
+                cmd = ["open", "-a", app]
+                if name == "chrome" and target_profile_dir:
+                    cmd.extend(["--args", f"--profile-directory={target_profile_dir}"])
+                if url:
+                    cmd.append(url)
                 try:
                     subprocess.run(cmd, check=True, timeout=10)
-                    return f"Opened in {name}: {url}" if url else f"Opened {name}."
+                    p_desc = f" ({target_profile_name or target_profile_dir})" if target_profile_dir else ""
+                    return f"Opened in {name}{p_desc}: {url}" if url else f"Opened {name}{p_desc}."
                 except Exception as e:
                     print(f"[Browser] 'open -a {app}' failed ({e}), trying binary…")
 
@@ -408,11 +601,17 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
                 exe = _find_exe_windows(_WIN_EXE_HINTS.get(name, name))
         if exe:
             try:
+                cmd = [exe]
+                if name == "chrome" and target_profile_dir:
+                    cmd.append(f"--profile-directory={target_profile_dir}")
+                if url:
+                    cmd.append(url)
                 subprocess.Popen(
-                    [exe, url] if url else [exe],
+                    cmd,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
-                return f"Opened in {name}: {url}" if url else f"Opened {name}."
+                p_desc = f" ({target_profile_name or target_profile_dir})" if target_profile_dir else ""
+                return f"Opened in {name}{p_desc}: {url}" if url else f"Opened {name}{p_desc}."
             except Exception as e:
                 print(f"[Browser] Native launch failed for {name}: {e}")
         print(f"[Browser] '{name}' not found — falling back to default browser.")
@@ -441,15 +640,152 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
         return f"Could not open a browser for: {url}"
 
 
+def _is_browser_running(browser_name: Optional[str] = None) -> bool:
+    target = (browser_name or "chrome").lower().strip()
+    target = _ALIASES.get(target, target)
+    proc_map = {
+        "chrome": ("chrome.exe", "google-chrome", "chromium"),
+        "edge": ("msedge.exe", "edge"),
+        "firefox": ("firefox.exe", "firefox"),
+        "opera": ("opera.exe",),
+        "operagx": ("opera.exe",),
+        "brave": ("brave.exe",),
+        "vivaldi": ("vivaldi.exe",),
+    }
+    match_names = proc_map.get(target, (f"{target}.exe", target))
+    try:
+        import psutil
+        for p in psutil.process_iter(["name"]):
+            pname = (p.info.get("name") or "").lower()
+            if any(m in pname for m in match_names):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _focus_browser_window(browser_name: Optional[str] = None) -> bool:
+    target = (browser_name or "chrome").lower().strip()
+    target = _ALIASES.get(target, target)
+
+    title_hints = {
+        "chrome": ["Google Chrome", "Chrome"],
+        "edge": ["Microsoft Edge", "Edge"],
+        "firefox": ["Mozilla Firefox", "Firefox"],
+        "opera": ["Opera"],
+        "operagx": ["Opera GX"],
+        "brave": ["Brave"],
+        "vivaldi": ["Vivaldi"],
+    }.get(target, [target.title()])
+
+    if _OS == "Windows":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            found_hwnds = []
+
+            def _enum_proc(hwnd, lParam):
+                if user32.IsWindowVisible(hwnd):
+                    length = user32.GetWindowTextLengthW(hwnd)
+                    if length > 0:
+                        buff = ctypes.create_unicode_buffer(length + 1)
+                        user32.GetWindowTextW(hwnd, buff, length + 1)
+                        txt = buff.value.lower()
+                        if any(hint.lower() in txt for hint in title_hints):
+                            found_hwnds.append(hwnd)
+                return True
+
+            EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            user32.EnumWindows(EnumWindowsProc(_enum_proc), 0)
+            if found_hwnds:
+                hwnd = found_hwnds[0]
+                SW_RESTORE = 9
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                user32.SetForegroundWindow(hwnd)
+                return True
+        except Exception:
+            pass
+
+        # Fallback to WScript.Shell AppActivate
+        for hint in title_hints:
+            try:
+                cmd = f'(New-Object -ComObject WScript.Shell).AppActivate("{hint}")'
+                res = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                    capture_output=True, text=True, timeout=3, creationflags=0x08000000
+                )
+                if "true" in res.stdout.lower():
+                    return True
+            except Exception:
+                pass
+
+    elif _OS == "Darwin":
+        app_name = _MAC_APP_NAMES.get(target, "Google Chrome")
+        try:
+            subprocess.run(["osascript", "-e", f'tell application "{app_name}" to activate'], timeout=3)
+            return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _navigate_current_tab(url: str, browser_name: Optional[str] = None) -> bool:
+    """
+    Navigates the currently active tab without opening a new tab.
+    Brings browser window to focus, uses Ctrl+L (Cmd+L), pastes URL, and presses Enter.
+    """
+    if not _is_browser_running(browser_name):
+        return False
+
+    url = _normalize_url(url)
+    if not url or url == "about:blank":
+        return False
+
+    focused = _focus_browser_window(browser_name)
+    if not focused:
+        return False
+
+    import time
+    time.sleep(0.35)
+
+    try:
+        import pyautogui
+        import pyperclip
+
+        # 1. Focus address bar of current active tab
+        address_hotkey = ("command", "l") if _OS == "Darwin" else ("ctrl", "l")
+        pyautogui.hotkey(*address_hotkey)
+        time.sleep(0.18)
+
+        # 2. Paste target URL
+        pyperclip.copy(url)
+        time.sleep(0.08)
+        paste_hotkey = ("command", "v") if _OS == "Darwin" else ("ctrl", "v")
+        pyautogui.hotkey(*paste_hotkey)
+        time.sleep(0.12)
+
+        # 3. Press Enter to navigate current tab
+        pyautogui.press("enter")
+        time.sleep(0.3)
+        return True
+    except Exception as e:
+        print(f"[Browser] Error navigating current tab: {e}")
+        return False
+
+
+
 class _BrowserSession:
     """
     A full session for one browser instance.
     All browsers open on the real profile via launch_persistent_context.
     """
 
-    def __init__(self, browser_name: str):
+    def __init__(self, browser_name: str, profile: Optional[str] = None):
         self.browser_name = browser_name
         self._spec        = _resolve_browser(browser_name)
+        self.profile_dir  = profile or (_get_selected_chrome_profile() if browser_name == "chrome" else None)
 
         self._loop:    asyncio.AbstractEventLoop | None = None
         self._thread:  threading.Thread | None          = None
@@ -553,7 +889,7 @@ class _BrowserSession:
                 self._context = await engine_obj.launch_persistent_context(jarvis, **kwargs)
 
             self._page = await self._adopt_page()
-            print(f"[Browser] ✅ Firefox launched")
+            print(f"[Browser] [OK] Firefox launched")
             return
 
         if engine_name == "webkit":
@@ -568,8 +904,24 @@ class _BrowserSession:
             }
             self._context = await engine_obj.launch_persistent_context(safari_profile, **kwargs)
             self._page = await self._adopt_page()
-            print(f"[Browser] ✅ Safari launched")
+            print(f"[Browser] [OK] Safari launched")
             return
+
+        p_dir = self.profile_dir or _get_selected_chrome_profile()
+
+        # 1. Try CDP connection if Chrome was launched with remote debugging
+        if self.browser_name == "chrome":
+            try:
+                import urllib.request
+                with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=0.8) as resp:
+                    if resp.status == 200:
+                        self._context = await engine_obj.connect_over_cdp("http://127.0.0.1:9222")
+                        pages = self._context.pages
+                        self._page = pages[0] if pages else await self._context.new_page()
+                        print(f"[Browser] [OK] Attached directly to running Chrome via CDP (Profile: {p_dir})")
+                        return
+            except Exception:
+                pass
 
         profile = _real_profile_dir(self.browser_name)
 
@@ -587,6 +939,8 @@ class _BrowserSession:
                 "--no-default-browser-check",
             ],
         }
+        if self.browser_name == "chrome" and p_dir:
+            kwargs["args"].append(f"--profile-directory={p_dir}")
 
         if exe:
             kwargs["executable_path"] = exe
@@ -597,28 +951,34 @@ class _BrowserSession:
             f"{self.browser_name}"
             + (f"/{channel}" if channel else "")
             + (f" @ {exe}" if exe else "")
+            + (f" [{p_dir}]" if p_dir else "")
         )
 
         try:
             self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
             self._page = await self._adopt_page()
-            print(f"[Browser] ✅ Launched [{label}] profile={profile}")
+            print(f"[Browser] [OK] Launched [{label}] profile={profile}")
             return
         except Exception as e:
-            print(f"[Browser] ⚠️  Real profile failed for {label}: {e}")
+            print(f"[Browser] [!] Real profile failed for {label}: {e}")
 
         # The real profile could not be opened (browser already open / locked
         # profile / newer Chrome versions block the real profile under
         # automation). Fall back to a persistent JARVIS automation profile —
-        # accounts logged in here once stay logged in on later sessions too.
+        # sync user's profile and Local State first so it doesn't open as a blank guest!
         jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
         Path(jarvis_profile).mkdir(parents=True, exist_ok=True)
-        print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile}")
+        if self.browser_name == "chrome" and p_dir:
+            try:
+                _sync_chrome_profile(p_dir)
+            except Exception:
+                pass
+        print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile} (profile: {p_dir})")
 
         try:
             self._context = await engine_obj.launch_persistent_context(jarvis_profile, **kwargs)
             self._page = await self._adopt_page()
-            print(f"[Browser] ✅ Launched [{label}] with JARVIS profile "
+            print(f"[Browser] [OK] Launched [{label}] with JARVIS profile "
                   f"(sign-ins persist across sessions)")
         except Exception as e2:
             raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
@@ -864,20 +1224,21 @@ class _SessionRegistry:
         url, self._last_native_url = self._last_native_url, ""
         return url
 
-    def _get_or_create(self, browser_name: str) -> _BrowserSession:
+    def _get_or_create(self, browser_name: str, profile: Optional[str] = None) -> _BrowserSession:
         with self._lock:
-            if browser_name not in self._sessions:
-                sess = _BrowserSession(browser_name)
+            key = f"{browser_name}:{profile}" if profile else browser_name
+            if key not in self._sessions:
+                sess = _BrowserSession(browser_name, profile=profile)
                 sess.start()
-                self._sessions[browser_name] = sess
-                print(f"[Registry] New session: {browser_name}")
-            return self._sessions[browser_name]
+                self._sessions[key] = sess
+                print(f"[Registry] New session: {key}")
+            return self._sessions[key]
 
-    def get(self, browser_name: str | None = None) -> _BrowserSession:
+    def get(self, browser_name: str | None = None, profile: Optional[str] = None) -> _BrowserSession:
         if not browser_name:
             browser_name = self._active_browser or _detect_default_browser()
         browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
-        sess = self._get_or_create(browser_name)
+        sess = self._get_or_create(browser_name, profile=profile)
         self._active_browser = browser_name
         return sess
 
@@ -916,8 +1277,8 @@ class _SessionRegistry:
                 return "No active browser sessions."
             lines = []
             for name in self._sessions:
-                marker = " ◀ active" if name == self._active_browser else ""
-                lines.append(f"  • {name}{marker}")
+                marker = " (active)" if name == self._active_browser else ""
+                lines.append(f"  * {name}{marker}")
             return "Open browsers:\n" + "\n".join(lines)
 
 
@@ -932,11 +1293,53 @@ def browser_control(
     params  = parameters or {}
     action  = params.get("action", "").lower().strip()
     browser = params.get("browser", "").lower().strip() or None
+    profile = params.get("profile", "").strip() or None
     result  = "Unknown action."
 
-    if action == "switch":
-        target = browser or params.get("target", "").lower().strip()
-        result = _registry.switch(target) if target else "Please specify a browser."
+    if action in ("list_profiles", "profiles"):
+        profiles = _list_chrome_profiles()
+        if not profiles:
+            result = "No Chrome profiles found."
+        else:
+            lines = ["Chrome profiles found on this computer:"]
+            for p in profiles:
+                active_flag = " (Currently active/open)" if p.get("is_active") else ""
+                sel_flag = " [Selected default]" if p.get("is_selected") else ""
+                email_str = f" <{p['email']}>" if p.get("email") else ""
+                lines.append(f"  • {p['name']}{email_str} (Directory: {p['directory']}){active_flag}{sel_flag}")
+            lines.append("\nYou can switch profiles anytime with: browser_control(action='set_profile', profile='Kunal' or 'Yash')")
+            result = "\n".join(lines)
+        _log(player, result)
+        return result
+
+    if action in ("set_profile", "switch_profile", "open_profile", "switch"):
+        target_p = profile or params.get("profile") or params.get("target") or params.get("name") or params.get("query") or params.get("description") or ""
+        # Check if the target is a Chrome profile
+        resolved = _resolve_chrome_profile(target_p) if target_p else None
+        if resolved:
+            result = _set_selected_chrome_profile(target_p, launch=True)
+            _log(player, result)
+            return result
+
+        # Check if the user specified browser (e.g. "chrome") and a profile
+        if browser or (target_p and target_p.lower() in ("chrome", "edge", "firefox", "opera", "operagx", "brave", "vivaldi", "safari")):
+            b_name = browser or target_p.lower()
+            if profile:
+                result = _set_selected_chrome_profile(profile, launch=True)
+                _log(player, result)
+                return result
+            # Launch the browser on screen
+            result = _open_native("", b_name)
+            _registry.switch(b_name)
+            _log(player, result)
+            return result
+
+        if not target_p and not browser:
+            result = "[FAILED] Please specify a browser or Chrome profile name (e.g. 'Chrome' or 'Kunal')."
+            _log(player, result)
+            return result
+
+        result = _registry.switch(target_p)
         _log(player, result)
         return result
 
@@ -956,15 +1359,15 @@ def browser_control(
         _log(player, result)
         return result
 
-    # ── Navigation is ALWAYS native ──────────────────────────────────────────
-    # go_to / search / new_tab open the site in the user's own browser —
-    # their own profile, logged-in accounts and start page; exactly as if the
-    # user had opened it themselves. A controlled window with about:blank never
-    # opens here. The only exception: if an automation flow is already running,
-    # navigation continues in that window (so multi-step tasks aren't split).
-    if action in ("go_to", "search", "new_tab"):
-        if _registry.has(browser):
-            sess = _registry.get(browser)
+    # ── Navigation is Native with user's real account profile ────────────────
+    # go_to / search / new_tab / open / launch open the site directly in the user's real browser —
+    # with their logged-in Google IDs, bookmarks and extensions.
+    # No guest window or blank profile opens.
+    if action in ("go_to", "search", "new_tab", "open", "launch", "open_browser"):
+        is_interactive = params.get("interactive", False)
+        # If explicitly marked interactive and session already exists, use session
+        if is_interactive and _registry.has(browser):
+            sess = _registry.get(browser, profile=profile)
             try:
                 if action == "search":
                     result = sess.run(sess.search(params.get("query", ""),
@@ -987,19 +1390,36 @@ def browser_control(
         else:
             nav_url = params.get("url", "").strip()
 
-        result = _open_native(nav_url, browser)
+        # By default, navigate inside the current active tab unless user explicitly asked for a new tab
+        want_new_tab = (action == "new_tab") or bool(params.get("new_tab", False))
+        if not want_new_tab and nav_url:
+            if _navigate_current_tab(nav_url, browser):
+                result = f"Navigated existing tab in {browser or 'Chrome'} to: {nav_url}"
+                _registry.note_native_url(_normalize_url(nav_url))
+                _log(player, result)
+                return result
+
+        result = _open_native(nav_url, browser, profile=profile)
         if result.startswith("Opened") and nav_url:
             _registry.note_native_url(_normalize_url(nav_url))
         _log(player, result)
         return result
 
     # ── Interactive actions (click/type/read…) ───────────────────────────────
-    # These require a physically controllable browser; the automation window
-    # only opens here, and as soon as it opens it goes to the user's last
-    # navigated page — it doesn't sit on a blank page.
+    # If the element cannot be found in Playwright DOM (e.g. user is browsing
+    # natively on desktop), falls back seamlessly to screen computer control vision!
     try:
-        sess = _registry.get(browser)
+        sess = _registry.get(browser, profile=profile)
     except Exception as e:
+        # Fallback to screen click if browser session couldn't start
+        if action in ("click", "smart_click"):
+            target_desc = params.get("description") or params.get("text") or ""
+            if target_desc:
+                try:
+                    from actions.computer_control import computer_control
+                    return computer_control({"action": "screen_click", "description": target_desc}, response, player)
+                except Exception:
+                    pass
         result = f"Could not start browser session: {e}"
         _log(player, result)
         return result
@@ -1014,6 +1434,17 @@ def browser_control(
 
         if action == "click":
             result = sess.run(sess.click(params.get("selector"), params.get("text")))
+            if ("not found" in result.lower() or "error" in result.lower()) and params.get("text"):
+                try:
+                    from actions.computer_control import computer_control
+                    desc = params.get("text")
+                    print(f"[Browser] Click '{desc}' not found in DOM, falling back to screen vision click...")
+                    cc_res = computer_control({"action": "screen_click", "description": desc}, response, player)
+                    if "Clicked" in cc_res:
+                        result = cc_res
+                except Exception as ex:
+                    print(f"[Browser] Screen click fallback failed: {ex}")
+
         elif action == "type":
             result = sess.run(sess.type_text(
                 params.get("selector"), params.get("text", ""), params.get("clear_first", True)))
@@ -1022,7 +1453,18 @@ def browser_control(
         elif action == "fill_form":
             result = sess.run(sess.fill_form(params.get("fields", {})))
         elif action == "smart_click":
-            result = sess.run(sess.smart_click(params.get("description", "")))
+            desc = params.get("description", "")
+            result = sess.run(sess.smart_click(desc))
+            if "could not find element" in result.lower() and desc:
+                try:
+                    from actions.computer_control import computer_control
+                    print(f"[Browser] Smart click '{desc}' not found in DOM, falling back to screen vision click...")
+                    cc_res = computer_control({"action": "screen_click", "description": desc}, response, player)
+                    if "Clicked" in cc_res:
+                        result = cc_res
+                except Exception as ex:
+                    print(f"[Browser] Screen click fallback failed: {ex}")
+
         elif action == "smart_type":
             result = sess.run(sess.smart_type(params.get("description", ""), params.get("text", "")))
         elif action == "get_text":
@@ -1063,17 +1505,21 @@ def _log(player, text: str):
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "browser_control",
-    "description": "Controls any web browser. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Simple open/search requests launch the user's own browser normally (their real profile and logged-in accounts); interactive actions (click, type, fill_form...) attach an automation browser. Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', 'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously.",
+    "description": "Controls any web browser with support for real user Chrome profiles and Google accounts. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, listing or switching Chrome profiles. All open/search requests launch the user's real browser normally with their active Google accounts.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"
+                "description": "go_to | search | new_tab | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | close_tab | screenshot | back | forward | reload | switch | list_browsers | list_profiles | set_profile | close | close_all. By default, go_to and search navigate inside the currently open tab without opening a new tab. Use new_tab ONLY when the user explicitly requests opening in a new tab ('naye tab me kholo')."
             },
             "browser": {
                 "type": "STRING",
                 "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."
+            },
+            "profile": {
+                "type": "STRING",
+                "description": "Target Chrome profile name, email, or directory (e.g. 'Kunal', 'Yash', 'Default', 'Profile 1'). Omit to use the user's active/selected profile."
             },
             "url": {
                 "type": "STRING",
@@ -1097,7 +1543,7 @@ TOOL = {
             },
             "description": {
                 "type": "STRING",
-                "description": "Element description for smart_click/smart_type"
+                "description": "Element description for smart_click/smart_type (e.g. 'Oggy video title', 'Subscribe button')"
             },
             "direction": {
                 "type": "STRING",
