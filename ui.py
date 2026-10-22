@@ -6220,6 +6220,13 @@ class JarvisUI:
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
 
+    def is_speaking(self) -> bool:
+        """Thread-safe: check if assistant voice output is currently active."""
+        try:
+            return bool(getattr(self._win.hud, "speaking", False))
+        except Exception:
+            return False
+
     def wait_for_api_key(self):
         while not self._win._ready:
             time.sleep(0.1)

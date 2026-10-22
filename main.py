@@ -265,9 +265,11 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
     ]
     if has_vision:
         out.append(
-            "- Your sight is not continuous. You see nothing until you call a "
-            "vision tool, and then only that single frame at that moment — you "
-            "cannot watch, monitor or notice something changing on screen.")
+            "- Continuous Screen Observation and Autonomous Workflow: When the user asks you to monitor the screen over time, "
+            "wait for a button to appear and click it (e.g. 'jab jab ye button aaye daba dena'), autonomously present a PPT/PDF presentation "
+            "slide-by-slide, or perform any ongoing/repetitive observation task, DO NOT REFUSE. You have the `continuous_work` tool "
+            "which continuously captures and analyzes the screen every 3 to 5 seconds to take actions, compare states, "
+            "and present slides autonomously.")
     else:
         out.append("- You have no sight at all in this build.")
     if has_mic:
