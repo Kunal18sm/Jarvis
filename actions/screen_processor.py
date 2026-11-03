@@ -85,18 +85,87 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         return img_bytes, f"image/{source_format.lower()}"
 
 
+def _capture_screen_gdi() -> tuple[bytes, str]:
+    """Ultra-fast, native Windows GDI screen capture attached to input desktop."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+
+    try:
+        hdesk = user32.OpenInputDesktop(0, False, 0x01FF)
+        if hdesk:
+            user32.SetThreadDesktop(hdesk)
+            user32.CloseDesktop(hdesk)
+    except Exception:
+        pass
+
+    w = user32.GetSystemMetrics(0)
+    h = user32.GetSystemMetrics(1)
+    hdc_screen = user32.GetDC(0)
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+    hbm = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+    old_bm = gdi32.SelectObject(hdc_mem, hbm)
+
+    SRCCOPY = 0x00CC0020
+    gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, 0, 0, SRCCOPY)
+    gdi32.SelectObject(hdc_mem, old_bm)
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD),
+            ("biWidth", wintypes.LONG),
+            ("biHeight", wintypes.LONG),
+            ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD),
+            ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD),
+            ("biXPelsPerMeter", wintypes.LONG),
+            ("biYPelsPerMeter", wintypes.LONG),
+            ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+    bmi = BITMAPINFOHEADER()
+    bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.biWidth = w
+    bmi.biHeight = -h
+    bmi.biPlanes = 1
+    bmi.biBitCount = 32
+    bmi.biCompression = 0
+
+    buf = ctypes.create_string_buffer(w * h * 4)
+    gdi32.GetDIBits(hdc_mem, hbm, 0, h, buf, ctypes.byref(bmi), 0)
+
+    gdi32.DeleteObject(hbm)
+    gdi32.DeleteDC(hdc_mem)
+    user32.ReleaseDC(0, hdc_screen)
+
+    img = PIL.Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert("RGB")
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return _compress(out.getvalue(), "PNG")
+
+
 def _capture_screen() -> tuple[bytes, str]:
+    if sys.platform == "win32":
+        try:
+            return _capture_screen_gdi()
+        except Exception as e:
+            print(f"[Vision] GDI capture fallback to MSS: {e}")
 
-    if not _MSS:
-        raise RuntimeError("mss is not installed. Run: pip install mss")
+    if _MSS:
+        try:
+            with mss.mss() as sct:
+                monitors = sct.monitors          # [0] = all combined, [1..n] = real screens
+                target   = monitors[1] if len(monitors) > 1 else monitors[0]
+                shot     = sct.grab(target)
+                png      = mss.tools.to_png(shot.rgb, shot.size)
+            return _compress(png, "PNG")
+        except Exception as e:
+            print(f"[Vision] MSS capture failed: {e}")
 
-    with mss.mss() as sct:
-        monitors = sct.monitors          # [0] = all combined, [1..n] = real screens
-        target   = monitors[1] if len(monitors) > 1 else monitors[0]
-        shot     = sct.grab(target)
-        png      = mss.tools.to_png(shot.rgb, shot.size)
-
-    return _compress(png, "PNG")
+    raise RuntimeError("Screen capture failed (all backends failed).")
 
 
 def _cv2_backend() -> int:

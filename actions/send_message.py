@@ -47,8 +47,44 @@ def _require_pyautogui():
         raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
 
 
-def _paste_text(text: str) -> None:
+def _get_active_window_title() -> str:
+    """Returns the title of the current foreground window."""
+    os_name = _get_os()
+    if os_name == "windows":
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if hwnd:
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buf, length + 1)
+                    return buf.value
+        except Exception:
+            pass
+    return ""
+
+
+def _is_jarvis_window_active() -> bool:
+    """Detects if Jarvis's own UI window is the active foreground window."""
+    t = _get_active_window_title().lower()
+    return any(k in t for k in ("jarvis", "j.a.r.v.i.s", "gemini assistant"))
+
+
+def _is_whatsapp_window_active() -> bool:
+    """Detects if WhatsApp window is currently the active foreground window."""
+    t = _get_active_window_title().lower()
+    return "whatsapp" in t
+
+
+def _paste_text(text: str) -> bool:
     _require_pyautogui()
+
+    # CRITICAL SAFEGUARD: Never type into Jarvis HUD!
+    if _is_jarvis_window_active():
+        print(f"[SendMessage] [CRITICAL GUARD] Blocked typing '{text[:25]}' because JARVIS HUD is focused!")
+        return False
 
     os_name = _get_os()
     paste_hotkey = ("command", "v") if os_name == "mac" else ("ctrl", "v")
@@ -60,10 +96,14 @@ def _paste_text(text: str) -> None:
         time.sleep(0.1)
     else:
         pyautogui.write(text, interval=0.03)
+    return True
 
 
 def _clear_and_paste(text: str) -> None:
     _require_pyautogui()
+    if _is_jarvis_window_active():
+        print("[SendMessage] [CRITICAL GUARD] Blocked clear_and_paste because JARVIS HUD is focused!")
+        return
     os_name = _get_os()
     select_all = ("command", "a") if os_name == "mac" else ("ctrl", "a")
     pyautogui.hotkey(*select_all)
@@ -77,7 +117,7 @@ def _is_app_running(app_name: str) -> bool:
         import psutil
         clean = app_name.lower().replace(".exe", "").strip()
         aliases = {
-            "whatsapp": ["whatsapp", "whatsapp.root"],
+            "whatsapp": ["whatsapp", "whatsappdesktop"],
             "telegram": ["telegram"],
             "discord": ["discord"],
             "slack": ["slack"],
@@ -183,49 +223,106 @@ def _desktop_send(app_name: str, receiver: str, message: str) -> str:
     time.sleep(0.3)
     return f"Message sent to {receiver} via {app_name}."
 
+def _activate_pc_whatsapp() -> bool:
+    """Brings WhatsApp window to foreground on Windows and verifies focus."""
+    os_name = _get_os()
+    if os_name == "windows":
+        # 1. PowerShell WScript.Shell AppActivate
+        try:
+            ps_cmd = '$ws = New-Object -ComObject WScript.Shell; if ($ws.AppActivate("WhatsApp")) { exit 0 } else { exit 1 }'
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True, timeout=2.0,
+                creationflags=0x08000000 if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            )
+            if res.returncode == 0:
+                time.sleep(0.4)
+                if _is_whatsapp_window_active():
+                    return True
+        except Exception:
+            pass
+
+        # 2. Win32 EnumWindows + SetForegroundWindow
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            found_hwnd = None
+
+            def _enum_win(h, _):
+                nonlocal found_hwnd
+                if user32.IsWindowVisible(h):
+                    length = user32.GetWindowTextLengthW(h)
+                    if length > 0:
+                        buf = ctypes.create_unicode_buffer(length + 1)
+                        user32.GetWindowTextW(h, buf, length + 1)
+                        if "whatsapp" in buf.value.lower():
+                            found_hwnd = h
+                            return 0
+                return 1
+
+            WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            user32.EnumWindows(WNDENUMPROC(_enum_win), 0)
+
+            if found_hwnd:
+                SW_RESTORE = 9
+                user32.ShowWindow(found_hwnd, SW_RESTORE)
+                time.sleep(0.1)
+                user32.SetForegroundWindow(found_hwnd)
+                time.sleep(0.3)
+                return True
+        except Exception:
+            pass
+
+    return _is_whatsapp_window_active()
+
+
 def _open_pc_whatsapp() -> bool:
     """Opens and focuses WhatsApp app on the PC, verifying it is active."""
     os_name = _get_os()
     if os_name == "windows":
-        # 1. Check if WhatsApp is already running
-        running = _is_app_running("whatsapp")
-        if not running:
-            # Launch via Windows protocol
-            subprocess.Popen("start whatsapp:", shell=True)
-            time.sleep(2.0)
-            running = _is_app_running("whatsapp")
+        # 1. If already open and active, return True immediately
+        if _activate_pc_whatsapp():
+            return True
 
-        if not running:
-            # Fallback: Start Menu launch
-            try:
-                pyautogui.press("win")
-                time.sleep(0.5)
-                pyautogui.write("WhatsApp", interval=0.04)
-                time.sleep(0.6)
-                pyautogui.press("enter")
-                time.sleep(2.5)
-                running = _is_app_running("whatsapp")
-                if not running:
-                    pyautogui.press("esc")
-            except Exception:
-                pass
-
-        if not running:
-            print("[SendMessage] [!] WhatsApp process not found on PC.")
-            return False
-
-        # 2. Focus/Activate WhatsApp window
+        # 2. Launch WhatsApp
+        # Method A: Windows Store App AUMID
         try:
-            cmd = 'Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::AppActivate("WhatsApp")'
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                capture_output=True, timeout=3, creationflags=0x08000000
+            subprocess.Popen(
+                "explorer.exe shell:AppsFolder\\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App",
+                shell=True
             )
-            time.sleep(0.8)
-        except Exception as e:
-            print(f"[SendMessage] Window focus warning: {e}")
+        except Exception:
+            pass
 
-        return True
+        # Method B: Protocol
+        try:
+            subprocess.Popen("start whatsapp:", shell=True)
+        except Exception:
+            pass
+
+        # Wait for window to initialize
+        for _ in range(8):
+            time.sleep(0.4)
+            if _activate_pc_whatsapp():
+                return True
+
+        # Method C: Start Menu search fallback
+        try:
+            pyautogui.press("win")
+            time.sleep(0.4)
+            pyautogui.write("WhatsApp", interval=0.03)
+            time.sleep(0.5)
+            pyautogui.press("enter")
+            for _ in range(8):
+                time.sleep(0.4)
+                if _activate_pc_whatsapp():
+                    return True
+        except Exception:
+            pass
+
+        return _is_whatsapp_window_active()
+
     elif os_name == "mac":
         return _open_app("WhatsApp")
     else:
@@ -239,18 +336,26 @@ def _send_whatsapp_pc(receiver: str, message: str = "", action: str = "send") ->
     2. Searches for contact (Ctrl + F)
     3. Opens their chat (Enter)
     4. Types message and sends (Enter)
+    If PC WhatsApp cannot be focused, seamlessly falls back to Chrome WhatsApp Web!
     """
     _require_pyautogui()
-    if not _open_pc_whatsapp():
-        return f"[FAILED] WhatsApp application is not running or could not be opened on your PC. Please check if WhatsApp desktop is installed or ask to send via Chrome."
 
-    time.sleep(1.0)
+    if not _open_pc_whatsapp():
+        print("[SendMessage] PC WhatsApp could not be opened/focused. Falling back to Chrome WhatsApp Web...")
+        return _send_whatsapp_chrome(receiver, message, action, fallback_from_pc=True)
+
+    # CRITICAL SAFETY CHECK: Ensure Jarvis is NOT focused!
+    if _is_jarvis_window_active() or not _is_whatsapp_window_active():
+        print("[SendMessage] [SAFETY ABORT] Target window is not WhatsApp (Jarvis active). Falling back to Chrome...")
+        return _send_whatsapp_chrome(receiver, message, action, fallback_from_pc=True)
+
+    time.sleep(0.6)
 
     # 1. Focus search bar in WhatsApp
     os_name = _get_os()
     search_key = ("command", "f") if os_name == "mac" else ("ctrl", "f")
     pyautogui.hotkey(*search_key)
-    time.sleep(0.5)
+    time.sleep(0.4)
 
     # 2. Clear previous search and enter contact name
     select_all = ("command", "a") if os_name == "mac" else ("ctrl", "a")
@@ -258,7 +363,8 @@ def _send_whatsapp_pc(receiver: str, message: str = "", action: str = "send") ->
     time.sleep(0.08)
     pyautogui.press("backspace")
     time.sleep(0.08)
-    _paste_text(receiver)
+    if not _paste_text(receiver):
+        return "[FAILED] Could not paste contact name (Jarvis HUD was focused). Aborted."
     time.sleep(1.2)
 
     # 3. Open chat
@@ -270,21 +376,24 @@ def _send_whatsapp_pc(receiver: str, message: str = "", action: str = "send") ->
         return f"WhatsApp chat with '{receiver}' is now open on PC."
 
     # 4. Type message and send
-    _paste_text(message)
+    if not _paste_text(message):
+        return "[FAILED] Could not paste message text (Jarvis HUD was focused). Aborted."
     time.sleep(0.3)
     pyautogui.press("enter")
     time.sleep(0.4)
     return f"Message sent to {receiver} via WhatsApp."
 
 
-def _send_whatsapp_chrome(receiver: str, message: str = "", action: str = "send") -> str:
+def _send_whatsapp_chrome(receiver: str, message: str = "", action: str = "send", fallback_from_pc: bool = False) -> str:
     """
     Opens WhatsApp Web in Chrome and opens chat / sends message.
-    Used when user specifically asks to send via Chrome.
+    Used when user specifically asks to send via Chrome or as a seamless fallback.
     """
     _require_pyautogui()
     from urllib.parse import quote_plus
     from actions.browser_control import _navigate_current_tab, _open_native
+
+    prefix = "PC WhatsApp app open nahi ho saka, isliye " if fallback_from_pc else ""
 
     digits = "".join(c for c in receiver if c.isdigit() or c == "+")
     if len(digits) >= 10:
@@ -295,30 +404,42 @@ def _send_whatsapp_chrome(receiver: str, message: str = "", action: str = "send"
             url = f"https://web.whatsapp.com/send?phone={clean_num}"
         if not _navigate_current_tab(url, "chrome"):
             _open_native(url, "chrome")
-        return f"Opened WhatsApp Web in Chrome for {receiver}."
+        return f"{prefix}Opened WhatsApp Web in Chrome for {receiver}."
 
     # Contact name search
     url = "https://web.whatsapp.com"
     if not _navigate_current_tab(url, "chrome"):
         _open_native(url, "chrome")
-    time.sleep(3.0)
+    time.sleep(3.5)
+
+    # Ensure Chrome is focused before typing
+    if _get_os() == "windows":
+        try:
+            ps_cmd = '$ws = New-Object -ComObject WScript.Shell; $ws.AppActivate("Chrome")'
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd], timeout=1.5)
+        except Exception:
+            pass
+
+    # Safety check: do not type into Jarvis!
+    if _is_jarvis_window_active():
+        return f"{prefix}[FAILED] Chrome window could not be focused. Please click on Chrome."
 
     # Search contact in WhatsApp Web (Ctrl+Alt+/)
     pyautogui.hotkey("ctrl", "alt", "/")
-    time.sleep(0.5)
+    time.sleep(0.6)
     _paste_text(receiver)
     time.sleep(1.2)
     pyautogui.press("enter")
     time.sleep(0.8)
 
     if action == "open_chat" or not message.strip():
-        return f"WhatsApp Web chat with '{receiver}' opened in Chrome."
+        return f"{prefix}WhatsApp Web chat with '{receiver}' opened in Chrome."
 
     _paste_text(message)
     time.sleep(0.3)
     pyautogui.press("enter")
     time.sleep(0.4)
-    return f"Message sent to {receiver} via WhatsApp Web in Chrome."
+    return f"{prefix}Message sent to {receiver} via WhatsApp Web in Chrome."
 
 
 def _schedule_message_task(seconds: int, task_fn, *args):

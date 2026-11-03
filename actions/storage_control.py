@@ -36,6 +36,12 @@ def storage_control(
             player.write_log(f"[storage] Total: {stats['total_formatted']}")
         return result
 
+    from core.security import verify_security_password, is_session_authorized
+    if action in ("clear_cache", "clean_cache", "clear_temp", "clear_memory", "reset_memory", "forget_all", "clean_all", "clear_all", "wipe"):
+        pwd = params.get("password", "")
+        if not verify_security_password(pwd) and not is_session_authorized():
+            return "HIGH SECURITY REJECTION: Wiping cache or memory is locked. Password ('tulip paris cake') is required."
+
     if action in ("clear_cache", "clean_cache", "clear_temp"):
         freed_cache = clear_browser_cache()
         freed_temp = clear_temp_files()
@@ -97,6 +103,10 @@ TOOL = {
             "keep_identity": {
                 "type": "BOOLEAN",
                 "description": "When clearing memory, set to true to keep user name and language preferences. Default is false."
+            },
+            "password": {
+                "type": "STRING",
+                "description": "Security authorization password. Required for clear/wipe actions ('tulip paris cake')."
             }
         }
     },

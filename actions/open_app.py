@@ -93,7 +93,7 @@ def _is_app_running(target: str) -> bool:
     if not target_clean:
         return False
     process_aliases = {
-        "whatsapp": ["whatsapp", "whatsapp.root"],
+        "whatsapp": ["whatsapp", "whatsappdesktop"],
         "chrome": ["chrome"],
         "google chrome": ["chrome"],
         "edge": ["msedge"],
@@ -156,9 +156,11 @@ def _launch_windows(app_name: str) -> bool:
         except Exception as e:
             print(f"[open_app] web url launch failed: {e}")
 
-    # 3. Native WhatsApp protocol
+    # 3. Native WhatsApp protocol & AppX
     if app_name.lower().strip() in ("whatsapp", "whatsapp:"):
         try:
+            # Try Store AUMID and protocol
+            subprocess.Popen("explorer.exe shell:AppsFolder\\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App", shell=True)
             subprocess.Popen("start whatsapp:", shell=True)
             time.sleep(2.0)
             if _is_app_running("whatsapp"):

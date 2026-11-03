@@ -265,11 +265,11 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
     ]
     if has_vision:
         out.append(
-            "- Continuous Screen Observation and Autonomous Workflow: When the user asks you to monitor the screen over time, "
-            "wait for a button to appear and click it (e.g. 'jab jab ye button aaye daba dena'), autonomously present a PPT/PDF presentation "
-            "slide-by-slide, or perform any ongoing/repetitive observation task, DO NOT REFUSE. You have the `continuous_work` tool "
-            "which continuously captures and analyzes the screen every 3 to 5 seconds to take actions, compare states, "
-            "and present slides autonomously.")
+            "- Vision & Task Scope: You have visual perception via `screen_process` or `computer_control`. "
+            "Always perform ordinary requests (opening apps, clicking once, finding files, looking at screen) as normal single actions. "
+            "DO NOT call `continuous_work` for ordinary requests. Use `continuous_work` ONLY when the user explicitly asks for ongoing "
+            "repetitive observation over time (e.g. 'jab jab ye button aaye tab tab daba dena'). When a user says they have a PDF or PPT "
+            "to present, ask where the file is and whether it is open first, rather than blindly presenting the screen.")
     else:
         out.append("- You have no sight at all in this build.")
     if has_mic:
@@ -841,6 +841,20 @@ class JarvisLive:
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
+        from core.security import verify_security_password, authorize_session
+        if verify_security_password(text):
+            authorize_session()
+            self.ui.write_log("[SECURITY] Password 'tulip paris cake' accepted - session authorized.")
+
+        # Route text feedback to active continuous task if waiting for user input
+        import actions.continuous_work as cw
+        if cw.is_active():
+            if any(w in text.lower() for w in ("ruko", "stop", "band karo", "cancel", "halt")):
+                cw.stop_continuous_work()
+                self.ui.write_log("[ContinuousWork] Stopped via user text command.")
+            elif cw.is_waiting_for_user():
+                cw.submit_user_feedback(text)
+                self.ui.write_log(f"[ContinuousWork] Feedback delivered: {text}")
         # Respect wake-word sleep: a typed command must not be answered while
         # asleep either (the sleep gate is not just for the mic). Wake first with
         # "Hey Jarvis" or the WAKE NOW button.
@@ -1157,6 +1171,11 @@ class JarvisLive:
 
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
+        try:
+            if hasattr(self.ui, "clear_input_focus"):
+                self.ui.clear_input_focus()
+        except Exception:
+            pass
 
 
         if name == "save_memory":
@@ -1172,6 +1191,24 @@ class JarvisLive:
                 id=fc.id, name=name,
                 response={"result": "ok", "silent": True}
             )
+
+        # High-security deletion protection gate
+        from core.security import (
+            is_delete_operation, verify_security_password,
+            is_session_authorized, get_security_prompt_instruction
+        )
+        if is_delete_operation(name, args):
+            pwd = args.get("password") or args.get("passphrase") or ""
+            if not verify_security_password(pwd) and not is_session_authorized():
+                result = get_security_prompt_instruction()
+                self.ui.write_log(f"[SECURITY] Delete operation '{name}' blocked - authorization required.")
+                print(f"[SECURITY] Delete operation '{name}' blocked - authorization required.")
+                if not self.ui.muted:
+                    self.ui.set_state("LISTENING")
+                return types.FunctionResponse(
+                    id=fc.id, name=name,
+                    response={"result": result}
+                )
 
         loop   = asyncio.get_event_loop()
         result = "Done."
@@ -1271,8 +1308,9 @@ class JarvisLive:
                 # file_processor: fall back to the currently-uploaded file when none is given
                 if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
+                _session_context = list(self._session_log[-12:]) if hasattr(self, "_session_log") else None
                 _ctx = {"player": self.ui, "speak": self.speak,
-                        "response": None, "session_memory": None}
+                        "response": None, "session_memory": _session_context}
                 r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
                 result = r or "Done."
                 # web_search: mirror results to the on-screen content panel
@@ -1566,6 +1604,10 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+                                from core.security import verify_security_password, authorize_session
+                                if verify_security_password(txt):
+                                    authorize_session()
+                                    self.ui.write_log("[SECURITY] Password 'tulip paris cake' accepted - session authorized.")
 
                         if sc.turn_complete:
                             if self._turn_done_event:
@@ -1585,6 +1627,16 @@ class JarvisLive:
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
+
+                                # Route spoken voice feedback to active continuous task if waiting for user
+                                import actions.continuous_work as cw
+                                if cw.is_active():
+                                    if any(w in full_in.lower() for w in ("ruko", "stop", "band karo", "cancel", "halt")):
+                                        cw.stop_continuous_work()
+                                        self.ui.write_log("[ContinuousWork] Stopped via voice command.")
+                                    elif cw.is_waiting_for_user():
+                                        cw.submit_user_feedback(full_in)
+                                        self.ui.write_log(f"[ContinuousWork] Feedback delivered: {full_in}")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",

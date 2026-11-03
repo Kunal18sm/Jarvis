@@ -266,8 +266,11 @@ def create_folder(path: str, name: str = "") -> str:
         return f"Could not create folder: {e}"
 
 
-def delete_file(path: str, name: str = "") -> str:
+def delete_file(path: str, name: str = "", password: str = "") -> str:
     try:
+        from core.security import verify_security_password, is_session_authorized
+        if not verify_security_password(password) and not is_session_authorized():
+            return "HIGH SECURITY REJECTION: Deletion is locked. Password ('tulip paris cake') is required to delete any file or folder."
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
@@ -670,7 +673,7 @@ def file_controller(
             return create_folder(path, name=name)
 
         elif action == "delete":
-            return delete_file(path, name=name)
+            return delete_file(path, name=name, password=params.get("password", ""))
 
         elif action == "move":
             return move_file(path, name=name, destination=params.get("destination", ""))
@@ -747,6 +750,10 @@ TOOL = {
             "content": {
                 "type": "STRING",
                 "description": "Content for create_file/write"
+            },
+            "password": {
+                "type": "STRING",
+                "description": "Security authorization password. Required for delete ('tulip paris cake')."
             },
             "name": {
                 "type": "STRING",

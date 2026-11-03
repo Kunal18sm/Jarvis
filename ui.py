@@ -6220,6 +6220,14 @@ class JarvisUI:
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
 
+    def clear_input_focus(self):
+        """Thread-safe: clear keyboard focus from command input field."""
+        try:
+            if hasattr(self._win, "_input") and self._win._input:
+                self._win._input.clearFocus()
+        except Exception:
+            pass
+
     def is_speaking(self) -> bool:
         """Thread-safe: check if assistant voice output is currently active."""
         try:
@@ -6336,4 +6344,4 @@ class JarvisUI:
         return self._win._check_autostart()
 
     def get_autostart(self) -> bool:
-        return self._win._check_autostart()
+        return self._win._check_autostart()
